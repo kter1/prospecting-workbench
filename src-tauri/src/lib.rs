@@ -1,0 +1,1411 @@
+mod adapters;
+mod ai;
+mod db;
+mod error;
+mod models;
+mod qualification;
+mod research;
+mod safety;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use reqwest::redirect::Policy;
+use reqwest::Client;
+use rusqlite::{params, Connection};
+use tauri::{AppHandle, Emitter, Manager, State};
+use uuid::Uuid;
+
+use crate::error::{AppError, AppResult};
+use crate::models::*;
+
+#[derive(Clone)]
+struct AppState {
+    database: Arc<Mutex<Connection>>,
+    client: Client,
+    app_data_dir: PathBuf,
+}
+
+impl AppState {
+    fn connection(&self) -> AppResult<std::sync::MutexGuard<'_, Connection>> {
+        self.database
+            .lock()
+            .map_err(|_| AppError::Message("The local database lock was poisoned.".into()))
+    }
+}
+
+#[tauri::command]
+fn bootstrap_app(state: State<'_, AppState>) -> AppResult<DashboardSnapshot> {
+    let connection = state.connection()?;
+    connection.execute(
+        "UPDATE evidence SET freshness=CASE
+           WHEN julianday('now')-julianday(retrieved_at) > 90 THEN 'stale'
+           WHEN julianday('now')-julianday(retrieved_at) > 30 THEN 'aging'
+           ELSE 'fresh' END",
+        [],
+    )?;
+    for account in db::list_accounts(&connection)? {
+        db::update_quality_flags(&connection, &account.id)?;
+    }
+    db::recover_interrupted_jobs(&connection)?;
+    let pending_jobs = connection.query_row(
+        "SELECT count(*) FROM jobs WHERE status='pending'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(DashboardSnapshot {
+        sales_play: db::load_sales_play(&connection)?,
+        offer_profile: db::load_offer_profile(&connection)?,
+        accounts: db::list_accounts(&connection)?,
+        pending_jobs,
+        due_for_daily_scan: db::due_for_daily_scan(&connection)?,
+        source_capabilities: db::source_capabilities(&connection)?,
+        search_runs: db::list_search_runs(&connection)?,
+    })
+}
+
+#[tauri::command]
+fn save_sales_play(state: State<'_, AppState>, sales_play: SalesPlay) -> AppResult<SalesPlay> {
+    db::save_sales_play(&*state.connection()?, sales_play)
+}
+
+#[tauri::command]
+async fn propose_sales_play(
+    state: State<'_, AppState>,
+    context: String,
+    current: SalesPlay,
+) -> AppResult<SalesPlay> {
+    let context = context.trim();
+    if context.len() < 12 {
+        return Err(AppError::Message(
+            "Add a website URL or a short description of the offer first.".into(),
+        ));
+    }
+    let source_text = if context.starts_with("http://") || context.starts_with("https://") {
+        let target = url::Url::parse(context)?;
+        if let Ok(robots_url) = target.join("/robots.txt") {
+            if let Ok(robots) = safety::fetch_public(&state.client, robots_url).await {
+                if !safety::robots_allows(&robots.text, target.path()) {
+                    return Err(AppError::Message(
+                        "The website excludes this page in robots.txt.".into(),
+                    ));
+                }
+            }
+        }
+        let page = safety::fetch_public(&state.client, target).await?;
+        format!(
+            "Source URL: {}\nTitle: {}\nSanitized public text:\n{}",
+            page.final_url, page.title, page.text
+        )
+    } else {
+        context.chars().take(5_000).collect()
+    };
+    ai::propose_sales_play(&state.client, &source_text, current).await
+}
+
+#[tauri::command]
+async fn interpret_prospecting_query(
+    state: State<'_, AppState>,
+    query: String,
+    geography: String,
+    result_limit: i64,
+    product_website: Option<String>,
+) -> AppResult<SearchBrief> {
+    let clean_query = query.trim().chars().take(5_000).collect::<String>();
+    let product_reference = product_website
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().chars().take(500).collect::<String>());
+    let play = db::load_sales_play(&*state.connection()?)?;
+    let (mut brief, _) = ai::interpret_search_brief(
+        &state.client,
+        &clean_query,
+        product_reference.as_deref(),
+        &geography,
+        result_limit,
+        play.as_ref(),
+    )
+    .await?;
+    if !adapters::get_searxng_url(&*state.connection()?)?.is_empty() {
+        brief.discovery_lanes.push(DiscoveryLane {
+            id: "local-search".into(),
+            label: "User-operated web search".into(),
+            mode: "automatic".into(),
+            source: "searxng".into(),
+            reason: "A local SearXNG instance is configured for broader public-web discovery."
+                .into(),
+            limitation: "Coverage depends on the engines enabled in the user's local instance."
+                .into(),
+        });
+    }
+    Ok(brief)
+}
+
+#[tauri::command]
+async fn start_search_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mut brief: SearchBrief,
+) -> AppResult<SearchRun> {
+    if !brief
+        .discovery_lanes
+        .iter()
+        .any(|lane| lane.mode == "automatic")
+    {
+        return Err(AppError::Message(
+            "This brief has no compliant automatic discovery lane. Use its guided searches or import account seeds.".into(),
+        ));
+    }
+    brief.approved = true;
+    let run = db::create_search_run(&*state.connection()?, &brief)?;
+    let background = state.inner().clone();
+    let run_id = run.id.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = execute_search_run(&background, &app, &run_id).await {
+            if let Ok(connection) = background.connection() {
+                let _ =
+                    db::finish_search_run(&connection, &run_id, "failed", Some(&error.to_string()));
+            }
+            if let Ok(connection) = background.connection() {
+                if let Ok(run) = db::get_search_run(&connection, &run_id) {
+                    let _ = app.emit("search-run-progress", run);
+                }
+            }
+        }
+    });
+    Ok(run)
+}
+
+#[tauri::command]
+fn list_search_runs(state: State<'_, AppState>) -> AppResult<Vec<SearchRunSummary>> {
+    db::list_search_runs(&*state.connection()?)
+}
+
+#[tauri::command]
+fn get_search_run(state: State<'_, AppState>, run_id: String) -> AppResult<SearchRun> {
+    db::get_search_run(&*state.connection()?, &run_id)
+}
+
+#[tauri::command]
+fn cancel_search_run(state: State<'_, AppState>, run_id: String) -> AppResult<SearchRun> {
+    db::cancel_search_run(&*state.connection()?, &run_id)
+}
+
+#[tauri::command]
+fn import_accounts(state: State<'_, AppState>, seeds: Vec<AccountSeed>) -> AppResult<Vec<Account>> {
+    db::import_accounts(&mut *state.connection()?, seeds)
+}
+
+#[tauri::command]
+fn list_accounts(state: State<'_, AppState>) -> AppResult<Vec<Account>> {
+    db::list_accounts(&*state.connection()?)
+}
+
+#[tauri::command]
+fn get_prospect_package(
+    state: State<'_, AppState>,
+    account_id: String,
+    search_run_id: Option<String>,
+) -> AppResult<ProspectPackage> {
+    db::get_package_for_run(&*state.connection()?, &account_id, search_run_id.as_deref())
+}
+
+#[tauri::command]
+fn apply_library_action(
+    state: State<'_, AppState>,
+    account_ids: Vec<String>,
+    action: String,
+) -> AppResult<Vec<Account>> {
+    db::apply_library_action(&mut *state.connection()?, &account_ids, &action)
+}
+
+#[tauri::command]
+fn permanently_delete_accounts(
+    state: State<'_, AppState>,
+    account_ids: Vec<String>,
+) -> AppResult<Vec<Account>> {
+    db::permanently_delete_accounts(&mut *state.connection()?, &account_ids)
+}
+
+#[tauri::command]
+async fn research_account(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> AppResult<ProspectPackage> {
+    let app = state.inner().clone();
+    let package = db::get_package(&*app.connection()?, &account_id)?;
+    if package.account.trashed_at.is_some() {
+        return Err(AppError::Message(
+            "Restore this prospect from Trash before researching it.".into(),
+        ));
+    }
+    let job_id = create_job(&app, Some(&account_id), "crawl")?;
+    match execute_research(&app, &account_id, &job_id).await {
+        Ok(()) => db::get_package(&*app.connection()?, &account_id),
+        Err(error) => {
+            fail_job(&app, &job_id, &error.to_string())?;
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+async fn generate_prospect_package(
+    state: State<'_, AppState>,
+    account_id: String,
+    provider: String,
+    kind: String,
+    override_review: bool,
+) -> AppResult<ProspectPackage> {
+    let (package, play) = {
+        let connection = state.connection()?;
+        (
+            db::get_package(&connection, &account_id)?,
+            db::require_approved_play(&connection)?,
+        )
+    };
+    if package.account.trashed_at.is_some() {
+        return Err(AppError::Message(
+            "Restore this prospect from Trash before generating a draft.".into(),
+        ));
+    }
+    if package.suppressed {
+        return Err(AppError::Message(
+            "This prospect is suppressed. Unsuppress it before generating a draft.".into(),
+        ));
+    }
+    let latest_state = db::latest_search_state(&*state.connection()?, &account_id)?
+        .unwrap_or_else(|| package.account.status.clone());
+    if !draft_status_allowed(&latest_state, override_review) {
+        return Err(AppError::Message(
+            "This account is not qualified. Review its evidence and use an explicit override if you still want a draft.".into(),
+        ));
+    }
+    let (assessment, draft, brief) =
+        ai::generate(&state.client, &package, &play, &provider, &kind).await?;
+    let evidence_ids = package
+        .evidence
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    {
+        let connection = state.connection()?;
+        db::save_account(&connection, &account_id)?;
+        db::save_generated_package(
+            &connection,
+            &account_id,
+            &assessment,
+            &draft,
+            &brief,
+            &evidence_ids,
+        )?;
+    }
+    db::get_package(&*state.connection()?, &account_id)
+}
+
+fn default_sales_play(package: &ProspectPackage) -> SalesPlay {
+    SalesPlay {
+        id: "active".into(),
+        name: "Prospect outreach".into(),
+        offer: package
+            .discovery_context
+            .as_ref()
+            .map(|context| context.query.clone())
+            .unwrap_or_default(),
+        icp_industries: Vec::new(),
+        company_sizes: Vec::new(),
+        target_personas: Vec::new(),
+        exclusions: Vec::new(),
+        proof_points: Vec::new(),
+        tone: "Concise, specific, and respectful".into(),
+        cta: "Ask for a short exploratory conversation".into(),
+        sender_name: String::new(),
+        sender_company: String::new(),
+        postal_address: String::new(),
+        opt_out_text: "If this is not relevant, reply and I will not contact you again.".into(),
+        approved: false,
+        updated_at: None,
+    }
+}
+
+async fn draft_readiness_for(state: &AppState, account_id: &str) -> AppResult<DraftReadiness> {
+    let (package, mut suggested_play, latest_state) = {
+        let connection = state.connection()?;
+        let package = db::get_package(&connection, account_id)?;
+        let mut play =
+            db::load_sales_play(&connection)?.unwrap_or_else(|| default_sales_play(&package));
+        if let Some(context) = &package.discovery_context {
+            if let Ok(run) = db::get_search_run(&connection, &context.search_run_id) {
+                if let Ok(brief) = db::get_search_brief(&connection, &run.brief_id) {
+                    if play.offer.trim().is_empty() {
+                        play.offer = brief.product_summary;
+                    }
+                    if play.target_personas.is_empty() {
+                        play.target_personas = brief.target_personas;
+                    }
+                    if play.exclusions.is_empty() {
+                        play.exclusions = brief.exclusions;
+                    }
+                }
+            }
+        }
+        let latest_state = db::latest_search_state(&connection, account_id)?
+            .unwrap_or_else(|| package.account.status.clone());
+        (package, play, latest_state)
+    };
+    if suggested_play.offer.trim().is_empty() {
+        if let Some(context) = &package.discovery_context {
+            suggested_play.offer = context.query.clone();
+        }
+    }
+    let mut missing_fields = Vec::new();
+    for (name, value) in [
+        ("offer", suggested_play.offer.as_str()),
+        ("senderName", suggested_play.sender_name.as_str()),
+        ("senderCompany", suggested_play.sender_company.as_str()),
+        ("postalAddress", suggested_play.postal_address.as_str()),
+        ("optOutText", suggested_play.opt_out_text.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            missing_fields.push(name.into());
+        }
+    }
+    let mut blockers = Vec::new();
+    if package.account.trashed_at.is_some() {
+        blockers.push("Restore this prospect from Trash before drafting.".into());
+    }
+    if package.suppressed {
+        blockers.push("This prospect is on the local do-not-contact list.".into());
+    }
+    if package.evidence.is_empty() {
+        blockers.push("Research must produce cited evidence before drafting.".into());
+    }
+    let ollama = ai::ollama_health(&state.client).await;
+    if !ollama.reachable || !ollama.model_installed {
+        blockers.push(ollama.message.clone());
+    }
+    let requires_review_override = latest_state != "qualified";
+    let requires_play_approval = !suggested_play.approved;
+    Ok(DraftReadiness {
+        ready: missing_fields.is_empty()
+            && blockers.is_empty()
+            && !requires_review_override
+            && !requires_play_approval,
+        missing_fields,
+        blockers,
+        requires_review_override,
+        requires_play_approval,
+        suggested_play,
+        ollama,
+    })
+}
+
+#[tauri::command]
+async fn get_draft_readiness(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> AppResult<DraftReadiness> {
+    draft_readiness_for(state.inner(), &account_id).await
+}
+
+#[tauri::command]
+async fn start_draft_generation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DraftGenerationRequest,
+) -> AppResult<ResearchJob> {
+    let readiness = draft_readiness_for(state.inner(), &request.account_id).await?;
+    if !readiness.missing_fields.is_empty() {
+        return Err(AppError::Message(
+            "DRAFT_SETUP_REQUIRED:Complete the highlighted offer and sender fields.".into(),
+        ));
+    }
+    if !readiness.blockers.is_empty() {
+        return Err(AppError::Message(readiness.blockers.join(" ")));
+    }
+    if readiness.requires_review_override && !request.override_review {
+        return Err(AppError::Message("Review this prospect's evidence and explicitly allow drafting for a non-qualified match.".into()));
+    }
+    let job_id = create_job_with_request(state.inner(), &request)?;
+    let background = state.inner().clone();
+    let background_app = app.clone();
+    let spawned_id = job_id.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = execute_generation_job(&background, &background_app, &spawned_id).await
+        {
+            let _ = fail_job(&background, &spawned_id, &error.to_string());
+            if let Ok(connection) = background.connection() {
+                if let Ok(job) = db::get_job(&connection, &spawned_id) {
+                    let _ = background_app.emit("draft-job-progress", job);
+                }
+            }
+        }
+    });
+    db::get_job(&*state.connection()?, &job_id)
+}
+
+fn draft_status_allowed(status: &str, override_review: bool) -> bool {
+    status == "qualified" || override_review
+}
+
+#[tauri::command]
+fn set_outcome(
+    state: State<'_, AppState>,
+    account_id: String,
+    outcome: String,
+) -> AppResult<ProspectPackage> {
+    let connection = state.connection()?;
+    db::set_outcome(&connection, &account_id, &outcome)?;
+    db::get_package(&connection, &account_id)
+}
+
+#[tauri::command]
+fn set_suppression(
+    state: State<'_, AppState>,
+    account_id: String,
+    suppressed: bool,
+) -> AppResult<ProspectPackage> {
+    let connection = state.connection()?;
+    db::set_suppression(&connection, &account_id, suppressed)?;
+    db::get_package(&connection, &account_id)
+}
+
+#[tauri::command]
+async fn discover_public(
+    state: State<'_, AppState>,
+    source: String,
+    query: String,
+) -> AppResult<Vec<DiscoveryResult>> {
+    let searxng = {
+        let connection = state.connection()?;
+        adapters::get_searxng_url(&connection)?
+    };
+    adapters::discover(
+        &state.client,
+        (!searxng.is_empty()).then_some(searxng),
+        &source,
+        &query,
+    )
+    .await
+}
+
+#[tauri::command]
+fn run_daily_scan(state: State<'_, AppState>) -> AppResult<i64> {
+    let count = db::queue_daily_scan(&*state.connection()?)?;
+    let app = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = process_pending_jobs(app).await;
+    });
+    Ok(count)
+}
+
+#[tauri::command]
+fn list_jobs(state: State<'_, AppState>) -> AppResult<Vec<ResearchJob>> {
+    db::list_jobs(&*state.connection()?)
+}
+
+#[tauri::command]
+async fn ollama_health(state: State<'_, AppState>) -> Result<OllamaHealth, AppError> {
+    Ok(ai::ollama_health(&state.client).await)
+}
+
+#[tauri::command]
+fn get_searxng_url(state: State<'_, AppState>) -> AppResult<String> {
+    adapters::get_searxng_url(&*state.connection()?)
+}
+
+#[tauri::command]
+fn set_searxng_url(state: State<'_, AppState>, url: String) -> AppResult<String> {
+    adapters::set_searxng_url(&*state.connection()?, &url)
+}
+
+#[tauri::command]
+fn export_data(state: State<'_, AppState>) -> AppResult<String> {
+    let payload = db::export_json(&*state.connection()?)?;
+    let export_dir = state.app_data_dir.join("exports");
+    std::fs::create_dir_all(&export_dir)?;
+    let filename = format!(
+        "prospecting-workbench-{}.json",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    );
+    let path = export_dir.join(filename);
+    std::fs::write(&path, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn export_diagnostics(state: State<'_, AppState>) -> AppResult<String> {
+    let health = ai::ollama_health(&state.client).await;
+    let payload = {
+        let connection = state.connection()?;
+        let account_count: i64 =
+            connection.query_row("SELECT count(*) FROM accounts", [], |row| row.get(0))?;
+        let evidence_count: i64 =
+            connection.query_row("SELECT count(*) FROM evidence", [], |row| row.get(0))?;
+        let job_counts = ["pending", "running", "complete", "failed"]
+            .into_iter()
+            .map(|status| {
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM jobs WHERE status=?1",
+                        params![status],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|count| (status, count))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+        let active_jobs = db::list_jobs(&connection)?.into_iter().filter(|job| matches!(job.status.as_str(), "pending" | "running")).map(|job| serde_json::json!({"kind":job.kind,"status":job.status,"progressPercent":job.progress_percent,"progressStage":job.progress_stage})).collect::<Vec<_>>();
+        serde_json::json!({
+            "format":"prospecting-workbench-diagnostics","generatedAt":db::now(),"appVersion":env!("CARGO_PKG_VERSION"),
+            "platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"accountCount":account_count,"evidenceCount":evidence_count,
+            "jobCounts":job_counts,"activeJobs":active_jobs,"ollama":health,"sources":db::source_capabilities(&connection)?
+        })
+    };
+    let export_dir = state.app_data_dir.join("exports");
+    std::fs::create_dir_all(&export_dir)?;
+    let path = export_dir.join(format!(
+        "prospecting-diagnostics-{}.json",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    std::fs::write(&path, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn import_data(state: State<'_, AppState>, payload: String) -> AppResult<()> {
+    db::restore_json(&mut *state.connection()?, &payload)
+}
+
+#[tauri::command]
+fn delete_all_data(state: State<'_, AppState>) -> AppResult<()> {
+    db::delete_all(&*state.connection()?)?;
+    let exports = state.app_data_dir.join("exports");
+    if exports.is_dir() {
+        std::fs::remove_dir_all(exports)?;
+    }
+    Ok(())
+}
+
+fn create_job(state: &AppState, account_id: Option<&str>, kind: &str) -> AppResult<String> {
+    let id = Uuid::new_v4().to_string();
+    state.connection()?.execute(
+        "INSERT INTO jobs(id,account_id,kind,status,scheduled_at) VALUES(?1,?2,?3,'pending',?4)",
+        params![id, account_id, kind, db::now()],
+    )?;
+    Ok(id)
+}
+
+fn create_job_with_request(
+    state: &AppState,
+    request: &DraftGenerationRequest,
+) -> AppResult<String> {
+    if !matches!(request.provider.as_str(), "ollama" | "fake")
+        || !matches!(request.kind.as_str(), "initial" | "follow_up")
+    {
+        return Err(AppError::Message("Unknown local draft request.".into()));
+    }
+    let id = Uuid::new_v4().to_string();
+    state.connection()?.execute(
+        "INSERT INTO jobs(id,account_id,kind,status,scheduled_at,progress_percent,progress_stage,request_json)
+         VALUES(?1,?2,'generate','pending',?3,0,'Queued',?4)",
+        params![id, request.account_id, db::now(), serde_json::to_string(request)?],
+    )?;
+    Ok(id)
+}
+
+fn publish_job_progress(
+    state: &AppState,
+    app: &AppHandle,
+    job_id: &str,
+    percent: i64,
+    stage: &str,
+) -> AppResult<()> {
+    let job = {
+        let connection = state.connection()?;
+        connection.execute(
+            "UPDATE jobs SET status=CASE WHEN ?2>=100 THEN 'complete' ELSE 'running' END,attempts=CASE WHEN status='pending' THEN attempts+1 ELSE attempts END,progress_percent=?2,progress_stage=?3 WHERE id=?1",
+            params![job_id, percent.clamp(0, 100), stage.chars().take(160).collect::<String>()],
+        )?;
+        db::get_job(&connection, job_id)?
+    };
+    let _ = app.emit("draft-job-progress", job);
+    Ok(())
+}
+
+async fn execute_generation_job(state: &AppState, app: &AppHandle, job_id: &str) -> AppResult<()> {
+    let job = db::get_job(&*state.connection()?, job_id)?;
+    let request: DraftGenerationRequest = job
+        .request
+        .ok_or_else(|| AppError::Message("Draft job is missing its persisted request.".into()))
+        .and_then(|value| serde_json::from_value(value).map_err(AppError::from))?;
+    publish_job_progress(state, app, job_id, 10, "Preparing and validating evidence")?;
+    let (package, play, latest_state) = {
+        let connection = state.connection()?;
+        let package = db::get_package(&connection, &request.account_id)?;
+        let play = db::require_approved_play(&connection)?;
+        let latest_state = db::latest_search_state(&connection, &request.account_id)?
+            .unwrap_or_else(|| package.account.status.clone());
+        (package, play, latest_state)
+    };
+    if package.account.trashed_at.is_some() {
+        return Err(AppError::Message(
+            "Restore this prospect from Trash before drafting.".into(),
+        ));
+    }
+    if !draft_status_allowed(&latest_state, request.override_review) {
+        return Err(AppError::Message(
+            "This prospect is not qualified; an explicit review override is required.".into(),
+        ));
+    }
+    publish_job_progress(state, app, job_id, 20, "Composing locally")?;
+    let (assessment, mut draft, brief) = ai::generate_with_progress(
+        &state.client,
+        &package,
+        &play,
+        &request.provider,
+        &request.kind,
+        |percent, stage| publish_job_progress(state, app, job_id, percent, stage),
+    )
+    .await?;
+    draft.id = job_id.to_string();
+    publish_job_progress(state, app, job_id, 95, "Saving verified artifacts")?;
+    let evidence_ids = package
+        .evidence
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    db::complete_generated_job(
+        &mut *state.connection()?,
+        job_id,
+        &request.account_id,
+        &assessment,
+        &draft,
+        &brief,
+        &evidence_ids,
+    )?;
+    let _ = app.emit(
+        "draft-job-progress",
+        db::get_job(&*state.connection()?, job_id)?,
+    );
+    Ok(())
+}
+
+async fn execute_research(state: &AppState, account_id: &str, job_id: &str) -> AppResult<()> {
+    execute_research_with_depth(state, account_id, job_id, false).await
+}
+
+async fn execute_quick_research(state: &AppState, account_id: &str, job_id: &str) -> AppResult<()> {
+    execute_research_with_depth(state, account_id, job_id, true).await
+}
+
+async fn execute_research_with_depth(
+    state: &AppState,
+    account_id: &str,
+    job_id: &str,
+    quick: bool,
+) -> AppResult<()> {
+    let account = {
+        let connection = state.connection()?;
+        connection.execute(
+            "UPDATE jobs SET status='running',attempts=attempts+1 WHERE id=?1",
+            params![job_id],
+        )?;
+        db::get_account(&connection, account_id)?
+    };
+    let mut facts = if quick {
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            research::crawl_account_quick(&state.client, &account),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Message(
+                "Quick public research exceeded its 6-second per-company budget.".into(),
+            )
+        })??
+    } else {
+        research::crawl_account(&state.client, &account).await?
+    };
+    if !quick {
+        facts.extend(adapters::refresh_public_signals(&state.client, &account).await);
+    }
+    {
+        let mut connection = state.connection()?;
+        let transaction = connection.transaction()?;
+        for fact in facts {
+            let evidence_id = db::upsert_evidence(
+                &transaction,
+                account_id,
+                &fact.source_url,
+                &fact.source_kind,
+                &fact.title,
+                &fact.excerpt,
+                &fact.confidence,
+            )?;
+            db::set_evidence_http_metadata(
+                &transaction,
+                &evidence_id,
+                fact.etag.as_deref(),
+                fact.modified_at.as_deref(),
+            )?;
+            for (kind, value, confidence) in fact.contacts {
+                let _ = db::add_contact(
+                    &transaction,
+                    account_id,
+                    &kind,
+                    &value,
+                    &evidence_id,
+                    &confidence,
+                );
+            }
+            for (category, summary, confidence) in fact.signals {
+                db::add_signal(
+                    &transaction,
+                    account_id,
+                    &category,
+                    &summary,
+                    &evidence_id,
+                    &confidence,
+                )?;
+            }
+        }
+        db::mark_researched(&transaction, account_id)?;
+        db::update_quality_flags(&transaction, account_id)?;
+        transaction.execute(
+            "UPDATE jobs SET status='complete',completed_at=?2,last_error=NULL WHERE id=?1",
+            params![job_id, db::now()],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn fail_job(state: &AppState, job_id: &str, message: &str) -> AppResult<()> {
+    state.connection()?.execute(
+        "UPDATE jobs SET status='failed',progress_stage='Failed',last_error=?2,completed_at=?3 WHERE id=?1",
+        params![
+            job_id,
+            message.chars().take(500).collect::<String>(),
+            db::now()
+        ],
+    )?;
+    Ok(())
+}
+
+async fn process_pending_jobs(state: AppState) -> AppResult<()> {
+    loop {
+        let jobs = {
+            let connection = state.connection()?;
+            let mut statement = connection.prepare("SELECT id,account_id FROM jobs WHERE status='pending' AND kind!='generate' AND account_id IS NOT NULL ORDER BY scheduled_at LIMIT 10")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if jobs.is_empty() {
+            break;
+        }
+        for (job_id, account_id) in jobs {
+            if let Err(error) = execute_research(&state, &account_id, &job_id).await {
+                let _ = fail_job(&state, &job_id, &error.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn process_pending_generation_jobs(state: AppState, app: AppHandle) -> AppResult<()> {
+    let ids = {
+        let connection = state.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id FROM jobs WHERE status='pending' AND kind='generate' ORDER BY scheduled_at",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for job_id in ids {
+        if let Err(error) = execute_generation_job(&state, &app, &job_id).await {
+            let _ = fail_job(&state, &job_id, &error.to_string());
+        }
+    }
+    Ok(())
+}
+
+async fn process_search_candidate(
+    state: &AppState,
+    run_id: &str,
+    account_id: &str,
+    brief: &SearchBrief,
+) -> AppResult<()> {
+    if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
+        return Ok(());
+    }
+    let account = db::get_account(&*state.connection()?, account_id)?;
+    let research_error = if account.website_url.is_some() || account.domain.is_some() {
+        db::update_search_run_account(
+            &*state.connection()?,
+            run_id,
+            account_id,
+            db::SearchRunAccountUpdate {
+                state: "researching",
+                score: None,
+                confidence: "medium",
+                rejection_reasons: &[],
+                features: &[],
+                assessment: None,
+                rank: None,
+                result_tier: "excluded",
+            },
+        )?;
+        let job_id = create_job(state, Some(account_id), "quick_crawl")?;
+        execute_quick_research(state, account_id, &job_id)
+            .await
+            .err()
+            .map(|error| {
+                let _ = fail_job(state, &job_id, &error.to_string());
+                error.to_string()
+            })
+    } else {
+        None
+    };
+    if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
+        return Ok(());
+    }
+    let package = db::get_package(&*state.connection()?, account_id)?;
+    let mut decision = qualification::assess_for_search(&package, brief);
+    if let Some(error) = research_error {
+        decision.state = "failed".into();
+        decision.rejection_reasons.push(format!(
+            "Public research failed: {}",
+            error.chars().take(240).collect::<String>()
+        ));
+    } else if account.website_url.is_none() && account.domain.is_none() {
+        decision.state = "needs_review".into();
+        decision.rejection_reasons.push(
+            "The discovery record did not provide a company website; guided identity resolution is required."
+                .into(),
+        );
+    }
+    let connection = state.connection()?;
+    db::update_search_run_account(
+        &connection,
+        run_id,
+        account_id,
+        db::SearchRunAccountUpdate {
+            state: &decision.state,
+            score: Some(decision.assessment.total),
+            confidence: &decision.evidence_confidence,
+            rejection_reasons: &decision.rejection_reasons,
+            features: &decision.features,
+            assessment: Some(&decision.assessment),
+            rank: None,
+            result_tier: if matches!(decision.state.as_str(), "qualified" | "needs_review") {
+                "near_match"
+            } else {
+                "excluded"
+            },
+        },
+    )?;
+    Ok(())
+}
+
+fn publish_search_progress(
+    state: &AppState,
+    app: &AppHandle,
+    run_id: &str,
+    percent: i64,
+    stage: &str,
+) -> AppResult<()> {
+    let run = {
+        let connection = state.connection()?;
+        db::set_search_run_stage(&connection, run_id, percent, stage)?;
+        db::get_search_run(&connection, run_id)?
+    };
+    let _ = app.emit("search-run-progress", run);
+    Ok(())
+}
+
+async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> AppResult<()> {
+    let brief = {
+        let connection = state.connection()?;
+        let run = db::get_search_run(&connection, run_id)?;
+        db::get_search_brief(&connection, &run.brief_id)?
+    };
+    publish_search_progress(state, app, run_id, 2, "Preparing enabled sources")?;
+    let candidate_budget = (brief.result_limit * 5).max(30).clamp(1, 100) as usize;
+    let mut results = Vec::new();
+    let automatic_lanes = brief
+        .discovery_lanes
+        .iter()
+        .filter(|lane| lane.mode == "automatic")
+        .collect::<Vec<_>>();
+    let lane_total = automatic_lanes.len().max(1) as i64;
+    for (lane_index, lane) in automatic_lanes.into_iter().enumerate() {
+        let lane_start = 5 + (lane_index as i64 * 20 / lane_total);
+        publish_search_progress(
+            state,
+            app,
+            run_id,
+            lane_start,
+            &format!("Searching {}", lane.label),
+        )?;
+        let lane_outcome: AppResult<Vec<DiscoveryResult>> = match lane.source.as_str() {
+            "overpass" => {
+                let mut categories = brief
+                    .segments
+                    .iter()
+                    .filter_map(|segment| segment.discovery_category.clone())
+                    .collect::<Vec<_>>();
+                categories.sort();
+                let cache_key = format!(
+                    "overpass:{}:{}",
+                    brief.geography.trim().to_ascii_lowercase(),
+                    categories.join(",")
+                );
+                let cached = db::cached_discoveries(&*state.connection()?, &cache_key)?;
+                let backoff = db::source_backoff(&*state.connection()?, "overpass")?;
+                if let Some((cached_results, _age)) = cached.as_ref().filter(|(_, age)| *age < 24) {
+                    Ok(cached_results.clone())
+                } else if let Some(message) = backoff {
+                    if let Some((cached_results, age)) = cached {
+                        db::add_search_warning(
+                            &*state.connection()?,
+                            run_id,
+                            SourceWarning {
+                                source: "OpenStreetMap Overpass".into(),
+                                message,
+                                used_cached_results: true,
+                                cache_age_hours: Some(age),
+                            },
+                        )?;
+                        Ok(cached_results)
+                    } else {
+                        Err(AppError::Message(message))
+                    }
+                } else {
+                    match adapters::discover_overpass(
+                        &state.client,
+                        &categories,
+                        &brief.geography,
+                        candidate_budget,
+                    )
+                    .await
+                    {
+                        Ok(found) => {
+                            db::cache_discoveries(
+                                &*state.connection()?,
+                                &cache_key,
+                                "overpass",
+                                &found,
+                            )?;
+                            Ok(found)
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            if let Some(rest) = message.strip_prefix("RATE_LIMIT:overpass:") {
+                                let mut parts = rest.splitn(2, ':');
+                                let seconds = parts
+                                    .next()
+                                    .and_then(|value| value.parse().ok())
+                                    .unwrap_or(60);
+                                let detail = parts.next().unwrap_or(&message);
+                                db::set_source_backoff(
+                                    &*state.connection()?,
+                                    "overpass",
+                                    seconds,
+                                    detail,
+                                )?;
+                            }
+                            if let Some((cached_results, age)) = cached {
+                                db::add_search_warning(
+                                    &*state.connection()?,
+                                    run_id,
+                                    SourceWarning {
+                                        source: "OpenStreetMap Overpass".into(),
+                                        message,
+                                        used_cached_results: true,
+                                        cache_age_hours: Some(age),
+                                    },
+                                )?;
+                                Ok(cached_results)
+                            } else {
+                                Err(error)
+                            }
+                        }
+                    }
+                }
+            }
+            source @ ("sec" | "usaspending") => {
+                adapters::discover(&state.client, None, source, &brief.query).await
+            }
+            "searxng" => {
+                let configured = adapters::get_searxng_url(&*state.connection()?)?;
+                let source_query = format!(
+                    "{} {} {}",
+                    brief
+                        .segments
+                        .first()
+                        .map(|item| item.label.as_str())
+                        .unwrap_or(&brief.product_summary),
+                    brief
+                        .positive_signals
+                        .first()
+                        .map(|item| item.label.as_str())
+                        .unwrap_or("company"),
+                    brief.geography
+                );
+                adapters::discover(
+                    &state.client,
+                    (!configured.is_empty()).then_some(configured),
+                    "searxng",
+                    &source_query,
+                )
+                .await
+            }
+            _ => Ok(Vec::new()),
+        };
+        match lane_outcome {
+            Ok(mut lane_results) => results.append(&mut lane_results),
+            Err(error) => db::add_search_warning(
+                &*state.connection()?,
+                run_id,
+                SourceWarning {
+                    source: lane.label.clone(),
+                    message: error.to_string(),
+                    used_cached_results: false,
+                    cache_age_hours: None,
+                },
+            )?,
+        }
+        publish_search_progress(
+            state,
+            app,
+            run_id,
+            5 + ((lane_index as i64 + 1) * 20 / lane_total),
+            &format!("Finished {}", lane.label),
+        )?;
+        if results.len() >= candidate_budget {
+            break;
+        }
+    }
+    results.sort_by(|left, right| {
+        discovery_priority(right)
+            .cmp(&discovery_priority(left))
+            .then_with(|| left.company_name.cmp(&right.company_name))
+    });
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|result| {
+        let key = result.domain.clone().unwrap_or_else(|| {
+            format!(
+                "{}|{}",
+                result.company_name.to_ascii_lowercase(),
+                result.source_url
+            )
+        });
+        seen.insert(key)
+    });
+    results.truncate(candidate_budget);
+    publish_search_progress(
+        state,
+        app,
+        run_id,
+        30,
+        &format!("Found {} candidate records", results.len()),
+    )?;
+    if results.is_empty() {
+        return Err(AppError::Message(
+            "No usable candidates were returned by the enabled free sources. Review the source warning or use guided discovery.".into(),
+        ));
+    }
+    let total = results.len() as i64;
+    db::set_search_run_counts(&*state.connection()?, run_id, total, 0)?;
+    db::set_search_run_progress(&*state.connection()?, run_id, 0, total)?;
+    let mut candidate_ids = Vec::with_capacity(results.len());
+    let mut seen_accounts = std::collections::HashSet::new();
+    for result in results {
+        if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
+            return Ok(());
+        }
+        let account_id = db::import_discovery_result(&mut *state.connection()?, run_id, &result)?;
+        db::update_search_run_account(
+            &*state.connection()?,
+            run_id,
+            &account_id,
+            db::SearchRunAccountUpdate {
+                state: "screening",
+                score: None,
+                confidence: result.identity_confidence.as_deref().unwrap_or("medium"),
+                rejection_reasons: &[],
+                features: &[],
+                assessment: None,
+                rank: None,
+                result_tier: "excluded",
+            },
+        )?;
+        if seen_accounts.insert(account_id.clone()) {
+            candidate_ids.push(account_id);
+        }
+    }
+    let total = candidate_ids.len() as i64;
+    db::set_search_run_progress(&*state.connection()?, run_id, 0, total)?;
+    publish_search_progress(
+        state,
+        app,
+        run_id,
+        40,
+        if total == 0 {
+            "No automatic candidates found"
+        } else {
+            "Candidates ready; checking public evidence"
+        },
+    )?;
+
+    // Research a broad pre-ranked pool in bounded batches. The requested count
+    // is the maximum number of strong matches, never a pre-research truncation.
+    const PARALLEL_RESEARCH: usize = 6;
+    const SEARCH_BUDGET_SECONDS: u64 = 45;
+    let started = std::time::Instant::now();
+    let mut completed = 0_i64;
+    let batch_size = brief.result_limit.max(1) as usize;
+    let mut confirmation_due = false;
+    for batch in candidate_ids.chunks(batch_size) {
+        if started.elapsed() >= Duration::from_secs(SEARCH_BUDGET_SECONDS) {
+            break;
+        }
+        let mut pending = batch.iter().cloned();
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            while tasks.len() < PARALLEL_RESEARCH {
+                let Some(account_id) = pending.next() else {
+                    break;
+                };
+                let background = state.clone();
+                let task_run_id = run_id.to_string();
+                let task_brief = brief.clone();
+                tasks.spawn(async move {
+                    let outcome = process_search_candidate(
+                        &background,
+                        &task_run_id,
+                        &account_id,
+                        &task_brief,
+                    )
+                    .await;
+                    (account_id, outcome)
+                });
+            }
+            if tasks.is_empty() {
+                break;
+            }
+            if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
+                tasks.abort_all();
+                return Ok(());
+            }
+            let (account_id, outcome) = tasks
+                .join_next()
+                .await
+                .ok_or_else(|| {
+                    AppError::Message("Search research queue stopped unexpectedly.".into())
+                })?
+                .map_err(|error| {
+                    AppError::Message(format!(
+                        "Search research worker stopped unexpectedly: {error}"
+                    ))
+                })?;
+            if let Err(error) = outcome {
+                let reasons = vec![format!(
+                    "Candidate processing failed: {}",
+                    error.to_string().chars().take(240).collect::<String>()
+                )];
+                db::update_search_run_account(
+                    &*state.connection()?,
+                    run_id,
+                    &account_id,
+                    db::SearchRunAccountUpdate {
+                        state: "failed",
+                        score: None,
+                        confidence: "low",
+                        rejection_reasons: &reasons,
+                        features: &[],
+                        assessment: None,
+                        rank: None,
+                        result_tier: "excluded",
+                    },
+                )?;
+            }
+            completed += 1;
+            db::set_search_run_progress(&*state.connection()?, run_id, completed, total)?;
+            db::set_search_run_counts(&*state.connection()?, run_id, total, completed)?;
+            publish_search_progress(
+                state,
+                app,
+                run_id,
+                40 + (completed * 55 / total.max(1)),
+                &format!("Researched {completed} of {total} discovered candidates"),
+            )?;
+            if started.elapsed() >= Duration::from_secs(SEARCH_BUDGET_SECONDS) {
+                tasks.abort_all();
+                break;
+            }
+        }
+        let (strong, _) = db::finalize_search_ranking(
+            &*state.connection()?,
+            run_id,
+            brief.qualification_threshold,
+            brief.quality_band,
+            brief.result_limit,
+        )?;
+        if confirmation_due {
+            break;
+        }
+        confirmation_due = strong >= brief.result_limit;
+        if started.elapsed() >= Duration::from_secs(SEARCH_BUDGET_SECONDS) {
+            break;
+        }
+    }
+    if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
+        return Ok(());
+    }
+    db::set_search_run_progress(&*state.connection()?, run_id, completed, total)?;
+    publish_search_progress(state, app, run_id, 98, "Finalizing ranked results")?;
+    db::finalize_search_ranking(
+        &*state.connection()?,
+        run_id,
+        brief.qualification_threshold,
+        brief.quality_band,
+        brief.result_limit,
+    )?;
+    db::finish_search_run(&*state.connection()?, run_id, "complete", None)?;
+    let _ = app.emit(
+        "search-run-progress",
+        db::get_search_run(&*state.connection()?, run_id)?,
+    );
+    Ok(())
+}
+
+fn discovery_priority(result: &DiscoveryResult) -> i64 {
+    let identity = match result.identity_confidence.as_deref() {
+        Some("high") => 20,
+        Some("medium") => 12,
+        _ => 0,
+    };
+    identity
+        + if result.website_url.is_some() { 45 } else { 0 }
+        + if result.domain.is_some() { 20 } else { 0 }
+        + if result.business_phone.is_some() {
+            10
+        } else {
+            0
+        }
+        + if result.location.is_some() { 5 } else { 0 }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            let app_data_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&app_data_dir)?;
+            let connection = db::open(&app_data_dir.join("prospecting.sqlite3"))?;
+            let mut resumable_searches = db::running_search_run_ids(&connection)?;
+            let resumable_search = resumable_searches.pop();
+            for stale_run in resumable_searches {
+                db::finish_search_run(
+                    &connection,
+                    &stale_run,
+                    "cancelled",
+                    Some("Interrupted because a newer search was active."),
+                )?;
+            }
+            let client = Client::builder()
+                .user_agent(
+                    "ProspectingWorkbenchBot/0.1 (+local desktop research; respects robots.txt)",
+                )
+                .redirect(Policy::none())
+                .connect_timeout(Duration::from_secs(8))
+                .timeout(Duration::from_secs(20))
+                .build()?;
+            let state = AppState {
+                database: Arc::new(Mutex::new(connection)),
+                client,
+                app_data_dir,
+            };
+            let background = state.clone();
+            let search_background = state.clone();
+            let generation_background = state.clone();
+            let search_app = app.handle().clone();
+            let generation_app = app.handle().clone();
+            app.manage(state);
+            tauri::async_runtime::spawn(async move {
+                let _ = process_pending_jobs(background).await;
+            });
+            tauri::async_runtime::spawn(async move {
+                if let Some(run_id) = resumable_search {
+                    if let Err(error) =
+                        execute_search_run(&search_background, &search_app, &run_id).await
+                    {
+                        if let Ok(connection) = search_background.connection() {
+                            let _ = db::finish_search_run(
+                                &connection,
+                                &run_id,
+                                "failed",
+                                Some(&error.to_string()),
+                            );
+                        }
+                    }
+                }
+            });
+            tauri::async_runtime::spawn(async move {
+                let _ =
+                    process_pending_generation_jobs(generation_background, generation_app).await;
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            bootstrap_app,
+            save_sales_play,
+            propose_sales_play,
+            interpret_prospecting_query,
+            start_search_run,
+            list_search_runs,
+            get_search_run,
+            cancel_search_run,
+            import_accounts,
+            list_accounts,
+            get_prospect_package,
+            apply_library_action,
+            permanently_delete_accounts,
+            research_account,
+            generate_prospect_package,
+            get_draft_readiness,
+            start_draft_generation,
+            set_outcome,
+            set_suppression,
+            discover_public,
+            run_daily_scan,
+            list_jobs,
+            ollama_health,
+            get_searxng_url,
+            set_searxng_url,
+            export_data,
+            export_diagnostics,
+            import_data,
+            delete_all_data
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Prospecting Workbench");
+}
+
+#[cfg(test)]
+mod command_policy_tests {
+    use super::draft_status_allowed;
+
+    #[test]
+    fn unqualified_drafts_require_an_explicit_override() {
+        assert!(draft_status_allowed("qualified", false));
+        assert!(!draft_status_allowed("needs_review", false));
+        assert!(!draft_status_allowed("researched", false));
+        assert!(draft_status_allowed("needs_review", true));
+    }
+}
