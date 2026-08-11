@@ -97,7 +97,8 @@ export interface SearchBrief {
   qualityBand: number;
   approved: boolean;
   assumptions: string[];
-  interpreter: "ollama" | "manual_rules";
+  /** `browser_preview` is the placeholder brief used when no desktop backend exists. */
+  interpreter: "ollama" | "manual_rules" | "browser_preview";
   modelTag?: string;
   modelDigest?: string;
   promptVersion: string;
@@ -139,7 +140,7 @@ export interface SearchRun {
   id: string;
   query: string;
   briefId: string;
-  status: "running" | "complete" | "failed" | "cancelled";
+  status: SearchRunStatus;
   progressCompleted: number;
   progressTotal: number;
   progressPercent: number;
@@ -154,6 +155,30 @@ export interface SearchRun {
   completedAt?: string;
   lastError?: string;
   accounts: SearchRunAccount[];
+}
+
+export type SearchRunStatus = "running" | "complete" | "failed" | "cancelled";
+
+/**
+ * Payload of the `search-run-progress` event.
+ *
+ * Counters only. Progress fires once per researched candidate, so carrying the
+ * full account list made each tick cost more as the pool grew. Accounts are
+ * fetched separately.
+ */
+export interface SearchRunProgress {
+  id: string;
+  status: SearchRunStatus;
+  progressCompleted: number;
+  progressTotal: number;
+  progressPercent: number;
+  progressStage: string;
+  resultLimit: number;
+  candidateCount: number;
+  researchedCount: number;
+  strongCount: number;
+  nearMatchCount: number;
+  finished: boolean;
 }
 
 export interface SearchRunSummary {

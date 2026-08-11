@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use regex::Regex;
 use reqwest::Client;
@@ -72,7 +73,7 @@ async fn crawl_account_with_page_budget(
                 .unwrap_or_default()
                 .trim_start_matches("www.");
             let lower = link.path().to_ascii_lowercase();
-            let is_public_job_board = host.ends_with("greenhouse.io") || host.ends_with("lever.co");
+            let is_public_job_board = is_public_job_board(host);
             if (host == root_host
                 && [
                     "about", "contact", "team", "leader", "career", "jobs", "news", "press", "blog",
@@ -143,6 +144,22 @@ async fn crawl_account_with_page_budget(
         ));
     }
     Ok(results)
+}
+
+/// Public job boards the crawler may follow off the company's own domain.
+///
+/// Matched on a dot boundary. `host.ends_with("lever.co")` also accepted
+/// `mylever.co` and `notlever.co` — registrable domains, not subdomains — so a
+/// link on a crawled page could steer the crawler to an attacker-controlled
+/// host, and the fetched content was then stored as `careers_page` evidence for
+/// that account. That source kind is trusted by signal scoring, so it could be
+/// used to manufacture hiring signals for a prospect.
+fn is_public_job_board(host: &str) -> bool {
+    const BOARDS: [&str; 2] = ["greenhouse.io", "lever.co"];
+    let host = host.trim_start_matches("www.").to_ascii_lowercase();
+    BOARDS
+        .iter()
+        .any(|board| host == *board || host.ends_with(&format!(".{board}")))
 }
 
 fn extract_facts(account: &Account, page: FetchResult) -> Vec<ResearchFact> {
@@ -277,7 +294,10 @@ fn extract_fact(account: &Account, page: FetchResult) -> ResearchFact {
 
     let mut contacts = Vec::new();
     let domain = account.domain.as_deref().unwrap_or_default();
-    let email_pattern = Regex::new(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b").unwrap();
+    // Both patterns are compiled once; this function runs for every page crawled.
+    static EMAIL_PATTERN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b").unwrap());
+    let email_pattern = &*EMAIL_PATTERN;
     for found in email_pattern.find_iter(&page.text) {
         let email = found
             .as_str()
@@ -306,10 +326,13 @@ fn extract_fact(account: &Account, page: FetchResult) -> ResearchFact {
             .to_ascii_lowercase()
             .contains("contact")
     {
-        let phone_pattern = Regex::new(
-            r"(?:\+?1[ .\-]?)?(?:\([2-9][0-9]{2}\)|[2-9][0-9]{2})[ .\-][0-9]{3}[ .\-][0-9]{4}",
-        )
-        .unwrap();
+        static PHONE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r"(?:\+?1[ .\-]?)?(?:\([2-9][0-9]{2}\)|[2-9][0-9]{2})[ .\-][0-9]{3}[ .\-][0-9]{4}",
+            )
+            .unwrap()
+        });
+        let phone_pattern = &*PHONE_PATTERN;
         for line in page.text.lines() {
             let context = line.to_ascii_lowercase();
             let labeled_business_line = [
@@ -358,9 +381,7 @@ fn source_kind(url: &Url) -> String {
         "usaspending_record"
     } else if path.contains("career")
         || path.contains("jobs")
-        || url
-            .host_str()
-            .is_some_and(|host| host.contains("greenhouse") || host.contains("lever.co"))
+        || url.host_str().is_some_and(is_public_job_board)
     {
         "careers_page"
     } else if path.contains("contact") {
@@ -451,6 +472,55 @@ mod tests {
             .contacts
             .iter()
             .any(|(kind, _, _)| kind == "company_main"));
+    }
+
+    #[test]
+    fn the_job_board_allowlist_is_anchored_on_a_dot_boundary() {
+        // The crawler may only leave the company's own domain for these hosts.
+        // `ends_with("lever.co")` also accepted registrable lookalikes, so a
+        // link on a crawled page could send the crawler to an attacker's host
+        // and have the result stored as trusted `careers_page` evidence.
+        for allowed in [
+            "greenhouse.io",
+            "boards.greenhouse.io",
+            "www.greenhouse.io",
+            "lever.co",
+            "jobs.lever.co",
+        ] {
+            assert!(is_public_job_board(allowed), "{allowed} should be allowed");
+        }
+        for lookalike in [
+            "mylever.co",
+            "notlever.co",
+            "evilgreenhouse.io",
+            "lever.co.attacker.test",
+            "greenhouse.io.evil.test",
+            "fakegreenhouse.io",
+            "",
+        ] {
+            assert!(
+                !is_public_job_board(lookalike),
+                "{lookalike} must not pass the allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lookalike_job_board_is_not_classified_as_a_careers_page() {
+        // `careers_page` is trusted by signal scoring, so misclassifying an
+        // attacker-controlled host would let it manufacture hiring signals.
+        assert_eq!(
+            source_kind(&Url::parse("https://jobs.lever.co/acme/1").unwrap()),
+            "careers_page"
+        );
+        assert_eq!(
+            source_kind(&Url::parse("https://mylever.co/acme").unwrap()),
+            "company_page"
+        );
+        assert_eq!(
+            source_kind(&Url::parse("https://evilgreenhouse.io/x").unwrap()),
+            "company_page"
+        );
     }
 
     #[test]

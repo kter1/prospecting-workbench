@@ -72,6 +72,11 @@ pub fn open(path: &Path) -> AppResult<Connection> {
             [],
         )?;
     }
+    // The FTS5 index was written on every evidence insert but never queried:
+    // there is no MATCH anywhere in the codebase. It was a write tax on the
+    // hottest insert path and could silently desync, since a contentless FTS5
+    // table gets no ON DELETE CASCADE.
+    connection.execute_batch("DROP TABLE IF EXISTS evidence_fts;")?;
     migrate_search_progress_schema(&connection)?;
     migrate_quality_first_schema(&connection)?;
     migrate_prompt_first_data(&connection)?;
@@ -135,10 +140,16 @@ fn migrate_quality_first_schema(connection: &Connection) -> AppResult<()> {
             )?;
         }
     }
+    let adding_assessment_flag =
+        !table_has_column(connection, "search_run_accounts", "assessment_ok")?;
     for (column, definition) in [
         ("assessment_json", "TEXT"),
         ("rank", "INTEGER"),
         ("result_tier", "TEXT NOT NULL DEFAULT 'near_match'"),
+        // Precomputed from assessment_json at write time so ranking never has
+        // to parse JSON. Ranking runs once per batch over the whole pool, so a
+        // per-row parse there is quadratic in the candidate count.
+        ("assessment_ok", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !table_has_column(connection, "search_run_accounts", column)? {
             connection.execute(
@@ -146,6 +157,9 @@ fn migrate_quality_first_schema(connection: &Connection) -> AppResult<()> {
                 [],
             )?;
         }
+    }
+    if adding_assessment_flag {
+        backfill_assessment_ok(connection)?;
     }
     for (column, definition) in [
         ("progress_percent", "INTEGER NOT NULL DEFAULT 0"),
@@ -211,6 +225,46 @@ fn migrate_quality_first_schema(connection: &Connection) -> AppResult<()> {
         "DELETE FROM search_briefs WHERE approved=0 AND NOT EXISTS(SELECT 1 FROM search_runs WHERE search_runs.brief_id=search_briefs.id)",
         [],
     )?;
+    Ok(())
+}
+
+/// Does this assessment clear the non-numeric half of the strong-match bar?
+///
+/// Split out so it is computed once when a candidate is scored rather than on
+/// every ranking pass.
+fn assessment_is_promotable(assessment: &FitAssessment) -> bool {
+    assessment
+        .hard_gates
+        .iter()
+        .all(|gate| gate.status == "pass")
+        && !assessment.reasons.is_empty()
+}
+
+/// One-time pass to populate `assessment_ok` for rows written before the
+/// column existed. Bounded by existing data and only runs on the migration.
+fn backfill_assessment_ok(connection: &Connection) -> AppResult<()> {
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT search_run_id,account_id,assessment_json FROM search_run_accounts WHERE assessment_json IS NOT NULL",
+        )?;
+        let mapped = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    for (run_id, account_id, json) in rows {
+        let promotable = serde_json::from_str::<FitAssessment>(&json)
+            .map(|assessment| assessment_is_promotable(&assessment))
+            .unwrap_or(false);
+        connection.execute(
+            "UPDATE search_run_accounts SET assessment_ok=?3 WHERE search_run_id=?1 AND account_id=?2",
+            params![run_id, account_id, i64::from(promotable)],
+        )?;
+    }
     Ok(())
 }
 
@@ -287,14 +341,18 @@ pub fn normalize_email(value: &str) -> Option<String> {
     }
 }
 
+/// Normalize a website URL supplied by a source or a user, rejecting anything
+/// that is not a public web address.
+///
+/// Delegates the host checks to `safety::validate_url` so a private or
+/// loopback address cannot be stored as a company website. Previously this only
+/// checked scheme, credentials, and port, so `http://127.0.0.1/admin` from an
+/// OpenStreetMap `website` tag, an imported CSV, or a reference-data record was
+/// accepted as an account's site. The crawler would still refuse to fetch it,
+/// but it had no business being saved as an identity in the first place.
 pub fn normalize_public_url(value: &str) -> Option<String> {
     let mut url = Url::parse(value.trim()).ok()?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || !matches!(url.port_or_known_default(), Some(80 | 443))
-        || normalize_domain(value).is_none()
-    {
+    if crate::safety::validate_url(&url).is_err() || normalize_domain(value).is_none() {
         return None;
     }
     url.set_fragment(None);
@@ -416,15 +474,28 @@ pub fn require_approved_play(connection: &Connection) -> AppResult<SalesPlay> {
 }
 
 pub fn list_accounts(connection: &Connection) -> AppResult<Vec<Account>> {
+    // The latest run score is resolved in one correlated subquery. Fetching it
+    // per account was an N+1: every row ran its own search_run_accounts join,
+    // and bootstrap_app called this twice. The SQL ORDER BY was also wasted,
+    // since the scores it sorted on were then overwritten and re-sorted.
     let sql = format!(
-        "SELECT {ACCOUNT_COLUMNS} FROM accounts ORDER BY COALESCE(score,-1) DESC, created_at DESC"
+        "SELECT {ACCOUNT_COLUMNS},
+           (SELECT ra.score FROM search_run_accounts ra
+              JOIN search_runs r ON r.id=ra.search_run_id
+             WHERE ra.account_id=accounts.id AND ra.score IS NOT NULL
+             ORDER BY r.started_at DESC LIMIT 1) AS latest_run_score
+         FROM accounts"
     );
     let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map([], account_from_row)?;
+    let rows = statement.query_map([], |row| {
+        let mut account = account_from_row(row)?;
+        if let Some(score) = row.get::<_, Option<i64>>(15)? {
+            account.score = Some(score);
+            account.score_label = Some(score_label(score).into());
+        }
+        Ok(account)
+    })?;
     let mut accounts = rows.collect::<Result<Vec<_>, _>>()?;
-    for account in &mut accounts {
-        apply_latest_run_score(connection, account)?;
-    }
     accounts.sort_by(|left, right| {
         right
             .score
@@ -541,7 +612,6 @@ pub fn permanently_delete_accounts(
         let rows = statement.query_map(params![account_id], |row| row.get::<_, String>(0))?;
         affected_runs.extend(rows.collect::<Result<Vec<_>, _>>()?);
         drop(statement);
-        transaction.execute("DELETE FROM evidence_fts WHERE evidence_id IN (SELECT id FROM evidence WHERE account_id=?1)", params![account_id])?;
         transaction.execute("DELETE FROM accounts WHERE id=?1", params![account_id])?;
     }
     for run_id in affected_runs {
@@ -744,10 +814,6 @@ pub fn upsert_evidence(
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'fresh')",
         params![id, account_id, source_url, source_kind, title, clean_excerpt, now(), content_hash, confidence],
     )?;
-    connection.execute(
-        "INSERT INTO evidence_fts(evidence_id,title,excerpt) VALUES(?1,?2,?3)",
-        params![id, title, clean_excerpt],
-    )?;
     Ok(id)
 }
 
@@ -835,8 +901,10 @@ pub fn mark_researched(connection: &Connection, account_id: &str) -> AppResult<(
 
 pub fn update_quality_flags(connection: &Connection, account_id: &str) -> AppResult<()> {
     let records = {
-        let mut statement = connection
-            .prepare("SELECT id,source_kind,excerpt,freshness FROM evidence WHERE account_id=?1")?;
+        let sql = format!(
+            "SELECT id,source_kind,excerpt,{DERIVED_FRESHNESS} FROM evidence WHERE account_id=?1"
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(params![account_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -847,8 +915,11 @@ pub fn update_quality_flags(connection: &Connection, account_id: &str) -> AppRes
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    let employee_pattern =
-        regex::Regex::new(r"(?i)\b([0-9][0-9,]{1,8})\s*\+?\s+employees\b").unwrap();
+    // Compiled once; this runs for every account touched by research.
+    static EMPLOYEE_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b([0-9][0-9,]{1,8})\s*\+?\s+employees\b").unwrap()
+    });
+    let employee_pattern = &*EMPLOYEE_PATTERN;
     let employee_values = records
         .iter()
         .filter_map(|(_, _, excerpt, _)| {
@@ -1022,8 +1093,19 @@ fn query_contacts(connection: &Connection, account_id: &str) -> AppResult<Vec<Co
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Freshness derived from `retrieved_at`.
+///
+/// Kept in one place so the read path and the quality-flag pass cannot
+/// disagree. The stored `freshness` column is retained only so exports written
+/// by older versions remain importable; it is no longer the source of truth.
+const DERIVED_FRESHNESS: &str = "CASE
+   WHEN julianday('now')-julianday(retrieved_at) > 90 THEN 'stale'
+   WHEN julianday('now')-julianday(retrieved_at) > 30 THEN 'aging'
+   ELSE 'fresh' END";
+
 fn query_evidence(connection: &Connection, account_id: &str) -> AppResult<Vec<Evidence>> {
-    let mut statement = connection.prepare("SELECT id,account_id,source_url,source_kind,title,excerpt,retrieved_at,published_at,content_hash,confidence,freshness,quality_flags FROM evidence WHERE account_id=?1 ORDER BY retrieved_at DESC")?;
+    let sql = format!("SELECT id,account_id,source_url,source_kind,title,excerpt,retrieved_at,published_at,content_hash,confidence,{DERIVED_FRESHNESS},quality_flags FROM evidence WHERE account_id=?1 ORDER BY retrieved_at DESC");
+    let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params![account_id], |row| {
         let flags: String = row.get(11)?;
         Ok(Evidence {
@@ -1253,19 +1335,6 @@ pub fn latest_search_state(connection: &Connection, account_id: &str) -> AppResu
         params![account_id],
         |row| row.get(0),
     ).optional().map_err(AppError::from)
-}
-
-pub fn save_account(connection: &Connection, account_id: &str) -> AppResult<()> {
-    let changed = connection.execute(
-        "UPDATE accounts SET saved_at=COALESCE(saved_at,?2),updated_at=?2 WHERE id=?1 AND trashed_at IS NULL",
-        params![account_id, now()],
-    )?;
-    if changed == 0 {
-        return Err(AppError::Message(
-            "Trashed prospects cannot be saved or drafted.".into(),
-        ));
-    }
-    Ok(())
 }
 
 pub fn recover_interrupted_jobs(connection: &Connection) -> AppResult<usize> {
@@ -1519,6 +1588,41 @@ pub fn get_search_run(connection: &Connection, run_id: &str) -> AppResult<Search
     })
 }
 
+/// Counters and status for a run, without touching `search_run_accounts`.
+///
+/// This is the read behind every progress tick, so it must stay O(1) in the
+/// size of the candidate pool.
+pub fn get_search_run_progress(
+    connection: &Connection,
+    run_id: &str,
+) -> AppResult<SearchRunProgress> {
+    connection
+        .query_row(
+            "SELECT id,status,progress_completed,progress_total,progress_percent,progress_stage,result_limit,candidate_count,researched_count,strong_count,near_match_count
+             FROM search_runs WHERE id=?1",
+            params![run_id],
+            |row| {
+                let status: String = row.get(1)?;
+                Ok(SearchRunProgress {
+                    id: row.get(0)?,
+                    finished: matches!(status.as_str(), "complete" | "failed" | "cancelled"),
+                    status,
+                    progress_completed: row.get(2)?,
+                    progress_total: row.get(3)?,
+                    progress_percent: row.get(4)?,
+                    progress_stage: row.get(5)?,
+                    result_limit: row.get(6)?,
+                    candidate_count: row.get(7)?,
+                    researched_count: row.get(8)?,
+                    strong_count: row.get(9)?,
+                    near_match_count: row.get(10)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| AppError::Message("Search run not found.".into()))
+}
+
 pub fn set_search_run_progress(
     connection: &Connection,
     run_id: &str,
@@ -1581,6 +1685,19 @@ pub fn cancel_search_run(connection: &Connection, run_id: &str) -> AppResult<Sea
         params![run_id, now()],
     )?;
     get_search_run(connection, run_id)
+}
+
+/// How many searches ran before this one.
+///
+/// Used to rotate which bounded regions a run samples first, so repeating a
+/// search explores new ground instead of re-reading one bounding box.
+pub fn search_rotation(connection: &Connection, run_id: &str) -> AppResult<usize> {
+    let count: i64 = connection.query_row(
+        "SELECT count(*) FROM search_runs WHERE started_at < (SELECT started_at FROM search_runs WHERE id=?1)",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as usize)
 }
 
 pub fn search_run_is_cancelled(connection: &Connection, run_id: &str) -> AppResult<bool> {
@@ -1712,10 +1829,11 @@ pub fn update_search_run_account(
     account_id: &str,
     update: SearchRunAccountUpdate<'_>,
 ) -> AppResult<()> {
+    let assessment_ok = i64::from(update.assessment.is_some_and(assessment_is_promotable));
     connection.execute(
-        "UPDATE search_run_accounts SET state=?3,score=?4,evidence_confidence=?5,rejection_reasons_json=?6,matched_features_json=?7,assessment_json=?8,rank=?9,result_tier=?10,updated_at=?11
+        "UPDATE search_run_accounts SET state=?3,score=?4,evidence_confidence=?5,rejection_reasons_json=?6,matched_features_json=?7,assessment_json=?8,rank=?9,result_tier=?10,assessment_ok=?11,updated_at=?12
          WHERE search_run_id=?1 AND account_id=?2",
-        params![run_id,account_id,update.state,update.score,update.confidence,serde_json::to_string(update.rejection_reasons)?,serde_json::to_string(update.features)?,update.assessment.map(serde_json::to_string).transpose()?,update.rank,update.result_tier,now()],
+        params![run_id,account_id,update.state,update.score,update.confidence,serde_json::to_string(update.rejection_reasons)?,serde_json::to_string(update.features)?,update.assessment.map(serde_json::to_string).transpose()?,update.rank,update.result_tier,assessment_ok,now()],
     )?;
     Ok(())
 }
@@ -1759,8 +1877,11 @@ pub fn finalize_search_ranking(
     quality_band: i64,
     result_limit: i64,
 ) -> AppResult<(i64, i64)> {
+    // Reads only numeric and flag columns. This runs once per research batch
+    // over the entire pool, so parsing every candidate's assessment here made
+    // the total work quadratic in the candidate count.
     let mut statement = connection.prepare(
-        "SELECT account_id,state,score,evidence_confidence,assessment_json FROM search_run_accounts WHERE search_run_id=?1 ORDER BY COALESCE(score,-1) DESC,created_at",
+        "SELECT account_id,state,score,evidence_confidence,assessment_ok FROM search_run_accounts WHERE search_run_id=?1 ORDER BY COALESCE(score,-1) DESC,created_at",
     )?;
     let rows = statement.query_map(params![run_id], |row| {
         Ok((
@@ -1768,26 +1889,26 @@ pub fn finalize_search_ranking(
             row.get::<_, String>(1)?,
             row.get::<_, Option<i64>>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
+            row.get::<_, i64>(4)? != 0,
         ))
     })?;
     let candidates = rows.collect::<Result<Vec<_>, _>>()?;
     let eligible = candidates
         .iter()
-        .filter(|(_, state, score, confidence, assessment)| {
-            let assessment: Option<FitAssessment> = assessment
-                .as_deref()
-                .and_then(|json| serde_json::from_str(json).ok());
+        .filter(|(_, state, score, confidence, assessment_ok)| {
             state == "qualified"
                 && score.is_some_and(|value| value >= threshold)
                 && matches!(confidence.as_str(), "medium" | "high")
-                && assessment.is_some_and(|value| {
-                    value.hard_gates.iter().all(|gate| gate.status == "pass")
-                        && !value.reasons.is_empty()
-                })
+                && *assessment_ok
         })
         .map(|(account_id, _, _, _, _)| account_id.clone())
         .collect::<std::collections::HashSet<_>>();
+    // The band is a window on the single best eligible score, never a
+    // candidate-to-candidate comparison. Chaining the comparison lets a long
+    // gentle slope qualify as one cluster — 95, 84, 73 would all promote under
+    // a 12-point band, a 22-point spread inside a "tight" tier. Strong Match
+    // means "within `quality_band` of the best result", and README documents
+    // that as a four-point span.
     let best = candidates
         .iter()
         .filter(|(account_id, _, _, _, _)| eligible.contains(account_id))
@@ -1901,7 +2022,15 @@ pub fn source_capabilities(connection: &Connection) -> AppResult<Vec<SourceCapab
             &["discover"],
             false,
             true,
-            "Bounded, cached business-category samples with OpenStreetMap attribution.",
+            "Bounded, cached samples of businesses with a mapped physical premise, with OpenStreetMap attribution.",
+        ),
+        capability(
+            "wikidata",
+            "Open reference data (Wikidata)",
+            &["discover"],
+            false,
+            true,
+            "U.S. organizations of any described type that publish a website. Covers firms with no physical premise, which the map cannot reach.",
         ),
         capability(
             "company_web",
@@ -2133,10 +2262,6 @@ pub fn restore_json(connection: &mut Connection, payload: &str) -> AppResult<()>
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![evidence.id,evidence.account_id,evidence.source_url,evidence.source_kind,evidence.title,evidence.excerpt,evidence.retrieved_at,evidence.published_at,evidence.content_hash,evidence.confidence,evidence.freshness,serde_json::to_string(&evidence.quality_flags)?],
             )?;
-            transaction.execute(
-                "INSERT INTO evidence_fts(evidence_id,title,excerpt) VALUES(?1,?2,?3)",
-                params![evidence.id, evidence.title, evidence.excerpt],
-            )?;
         }
         for contact in package.contacts {
             transaction.execute(
@@ -2235,8 +2360,7 @@ pub fn restore_json(connection: &mut Connection, payload: &str) -> AppResult<()>
 
 pub fn delete_all(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
-        "DELETE FROM evidence_fts;
-         DELETE FROM search_run_accounts; DELETE FROM search_runs; DELETE FROM search_briefs; DELETE FROM source_identities; DELETE FROM discovery_cache; DELETE FROM source_backoff; DELETE FROM offer_profile;
+        "DELETE FROM search_run_accounts; DELETE FROM search_runs; DELETE FROM search_briefs; DELETE FROM source_identities; DELETE FROM discovery_cache; DELETE FROM source_backoff; DELETE FROM offer_profile;
          DELETE FROM outcomes; DELETE FROM suppressions; DELETE FROM jobs; DELETE FROM draft_artifacts; DELETE FROM packages;
          DELETE FROM contacts; DELETE FROM signals; DELETE FROM evidence; DELETE FROM people; DELETE FROM accounts;
          DELETE FROM sales_play; DELETE FROM settings;",
@@ -2263,6 +2387,34 @@ mod tests {
     }
 
     #[test]
+    fn a_private_address_is_never_stored_as_a_company_website() {
+        // A `website` tag in OpenStreetMap, a CSV column, and a reference-data
+        // record are all untrusted. These used to pass, because only the
+        // scheme, credentials, and port were checked.
+        for hostile in [
+            "http://127.0.0.1/admin",
+            "http://192.168.0.5/",
+            "http://10.1.2.3/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "http://localhost/",
+            "http://intranet.local/",
+            "https://user:pass@example.com/",
+            "https://example.com:8443/",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                normalize_public_url(hostile).is_none(),
+                "{hostile} must not be accepted as a public website"
+            );
+        }
+        assert_eq!(
+            normalize_public_url("https://example.com/about#team").as_deref(),
+            Some("https://example.com/about")
+        );
+    }
+
+    #[test]
     fn normalizes_contacts_conservatively() {
         assert_eq!(
             normalize_email(" Name@Example.COM "),
@@ -2282,13 +2434,21 @@ mod tests {
     }
 
     #[test]
-    fn migrated_database_has_fts5() {
+    fn migration_drops_the_unused_full_text_index() {
         let directory = tempfile::tempdir().unwrap();
-        let connection = open(&directory.path().join("test.sqlite3")).unwrap();
-        let count: i64 = connection
-            .query_row("SELECT count(*) FROM evidence_fts", [], |row| row.get(0))
+        let path = directory.path().join("test.sqlite3");
+        let connection = open(&path).unwrap();
+        let present: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='evidence_fts'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(present, 0, "the write-only FTS index must not be recreated");
+        // Reopening an existing database must stay clean and not error.
+        drop(connection);
+        assert!(open(&path).is_ok());
     }
 
     #[test]
@@ -2388,9 +2548,11 @@ mod tests {
             "low",
         )
         .unwrap();
+        // Freshness is derived from `retrieved_at`, so age the row rather than
+        // writing the label directly. This exercises the real mechanism.
         connection
             .execute(
-                "UPDATE evidence SET freshness='stale' WHERE id=?1",
+                "UPDATE evidence SET retrieved_at=datetime('now','-100 days') WHERE id=?1",
                 params![first],
             )
             .unwrap();
@@ -2489,6 +2651,99 @@ mod tests {
         );
     }
 
+    fn ranking_brief(quality_band: i64) -> SearchBrief {
+        SearchBrief {
+            id: Uuid::new_v4().to_string(),
+            query: "Find plumbing companies needing better phone intake".into(),
+            product_summary: "Voice intake".into(),
+            customer_outcome: "Capture calls".into(),
+            segments: vec![],
+            geography: "United States".into(),
+            company_sizes: vec![],
+            target_personas: vec![],
+            positive_signals: vec![],
+            exclusions: vec![],
+            discovery_lanes: vec![DiscoveryLane {
+                id: "mapped".into(),
+                label: "Mapped".into(),
+                mode: "automatic".into(),
+                source: "overpass".into(),
+                reason: "test".into(),
+                limitation: "test".into(),
+            }],
+            result_limit: 10,
+            qualification_threshold: 70,
+            quality_band,
+            approved: true,
+            assumptions: vec![],
+            interpreter: "manual_rules".into(),
+            model_tag: None,
+            model_digest: None,
+            prompt_version: SEARCH_PROMPT_VERSION.into(),
+            created_at: now(),
+        }
+    }
+
+    /// Import one discovered candidate already scored and assessed.
+    fn seed_ranked_candidate(
+        connection: &mut Connection,
+        run_id: &str,
+        index: usize,
+        score: i64,
+    ) -> String {
+        let result = DiscoveryResult {
+            source: "Fixture".into(),
+            company_name: format!("Company {index}"),
+            domain: Some(format!("company{index}.example")),
+            website_url: Some(format!("https://company{index}.example")),
+            external_id: None,
+            reason: "Fixture discovery".into(),
+            source_url: format!("https://source.example/{index}"),
+            source_external_id: None,
+            business_phone: None,
+            location: Some("United States".into()),
+            identity_confidence: Some("medium".into()),
+        };
+        let account_id = import_discovery_result(connection, run_id, &result).unwrap();
+        let fit = FitAssessment {
+            hard_gates: vec![HardGate {
+                label: "Identity".into(),
+                status: "pass".into(),
+                reason: "Verified".into(),
+            }],
+            icp_fit: score,
+            signal_relevance: score,
+            persona_fit: score,
+            evidence_contactability: score,
+            total: score,
+            reasons: vec![CitedReason {
+                text: "Direct supported signal".into(),
+                evidence_ids: vec!["evidence".into()],
+            }],
+        };
+        update_search_run_account(
+            connection,
+            run_id,
+            &account_id,
+            SearchRunAccountUpdate {
+                state: if score >= 70 {
+                    "qualified"
+                } else {
+                    "needs_review"
+                },
+                score: Some(score),
+                confidence: "medium",
+                rejection_reasons: &[],
+                features: &[],
+                assessment: Some(&fit),
+                rank: None,
+                result_tier: "near_match",
+            },
+        )
+        .unwrap();
+        account_id
+    }
+
     #[test]
     fn quality_first_ranking_returns_a_narrow_strong_band() {
         let directory = tempfile::tempdir().unwrap();
@@ -2577,6 +2832,8 @@ mod tests {
             )
             .unwrap();
         }
+        // The band is measured from the best eligible score: 82 is the top, so
+        // only scores at or above 78 are strong. 75 is 7 below and demotes.
         assert_eq!(
             finalize_search_ranking(&connection, &run.id, 70, 4, 10).unwrap(),
             (2, 2)
@@ -2592,6 +2849,80 @@ mod tests {
             vec![82, 78]
         );
         assert_eq!(ranked.strong_count, 2);
+    }
+
+    #[test]
+    fn the_band_never_chains_from_one_candidate_to_the_next() {
+        // Regression guard. Comparing each candidate against its predecessor
+        // instead of the best score lets a gentle slope masquerade as a tight
+        // cluster: 95 -> 84 -> 73 are 11 apart in sequence but span 22 points,
+        // so promoting all three would make "Strong Match" meaningless.
+        let directory = tempfile::tempdir().unwrap();
+        let mut connection = open(&directory.path().join("chain.sqlite3")).unwrap();
+        let brief = ranking_brief(12);
+        let run = create_search_run(&connection, &brief).unwrap();
+        for (index, score) in [95_i64, 84, 73].into_iter().enumerate() {
+            seed_ranked_candidate(&mut connection, &run.id, index, score);
+        }
+        // Each step is 11, so the chaining bug promoted all three. Measured
+        // from the best, 73 is 22 below and drops out.
+        let (strong, near) = finalize_search_ranking(&connection, &run.id, 70, 12, 10).unwrap();
+        assert_eq!(strong, 2, "73 is 22 below the top score, not 11");
+        assert_eq!(near, 1);
+        let ranked = get_search_run(&connection, &run.id).unwrap();
+        assert_eq!(
+            ranked
+                .accounts
+                .iter()
+                .filter(|item| item.result_tier == "strong")
+                .map(|item| item.score.unwrap())
+                .collect::<Vec<_>>(),
+            vec![95, 84]
+        );
+
+        // At the shipped four-point default the same chain yields only the top.
+        let (strong, _) = finalize_search_ranking(&connection, &run.id, 70, 4, 10).unwrap();
+        assert_eq!(strong, 1, "only 95 is within four points of the best");
+    }
+
+    #[test]
+    fn the_strong_tier_stays_within_four_points_of_the_best() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut connection = open(&directory.path().join("cliff.sqlite3")).unwrap();
+        let brief = ranking_brief(4);
+        let run = create_search_run(&connection, &brief).unwrap();
+        for (index, score) in [95_i64, 93, 91, 74, 72].into_iter().enumerate() {
+            seed_ranked_candidate(&mut connection, &run.id, index, score);
+        }
+        assert_eq!(
+            finalize_search_ranking(&connection, &run.id, 70, 4, 10).unwrap(),
+            (3, 2)
+        );
+        let ranked = get_search_run(&connection, &run.id).unwrap();
+        assert_eq!(
+            ranked
+                .accounts
+                .iter()
+                .filter(|item| item.result_tier == "strong")
+                .map(|item| item.score.unwrap())
+                .collect::<Vec<_>>(),
+            vec![95, 93, 91]
+        );
+    }
+
+    #[test]
+    fn ranking_never_returns_more_than_the_requested_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut connection = open(&directory.path().join("limit.sqlite3")).unwrap();
+        let brief = ranking_brief(4);
+        let run = create_search_run(&connection, &brief).unwrap();
+        for (index, score) in [90_i64, 89, 88, 87, 86, 85].into_iter().enumerate() {
+            seed_ranked_candidate(&mut connection, &run.id, index, score);
+        }
+        // 90..=86 are within four of the top; the limit of 3 caps them anyway.
+        let (strong, near) = finalize_search_ranking(&connection, &run.id, 70, 4, 3).unwrap();
+        assert_eq!(strong, 3, "the requested limit caps the strong tier");
+        assert_eq!(near, 3, "the rest stay visible as near matches");
     }
 
     #[test]

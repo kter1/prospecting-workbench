@@ -56,8 +56,6 @@ export const api = {
     invoke<Account[]>("permanently_delete_accounts", { accountIds }),
   researchAccount: (accountId: string) =>
     invoke<ProspectPackage>("research_account", { accountId }),
-  generatePackage: (accountId: string, provider: "ollama" | "fake" = "ollama", kind: "initial" | "follow_up" = "initial", overrideReview = false) =>
-    invoke<ProspectPackage>("generate_prospect_package", { accountId, provider, kind, overrideReview }),
   getDraftReadiness: (accountId: string) =>
     invoke<DraftReadiness>("get_draft_readiness", { accountId }),
   startDraftGeneration: (request: DraftGenerationRequest) =>

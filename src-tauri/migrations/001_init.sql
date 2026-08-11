@@ -49,13 +49,6 @@ CREATE TABLE IF NOT EXISTS evidence (
   UNIQUE(account_id, source_url, content_hash)
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(
-  evidence_id UNINDEXED,
-  title,
-  excerpt,
-  tokenize = 'unicode61'
-);
-
 CREATE TABLE IF NOT EXISTS contacts (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

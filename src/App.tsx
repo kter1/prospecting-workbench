@@ -1,11 +1,10 @@
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { listen } from "@tauri-apps/api/event";
 import { api, isDesktopRuntime } from "./api";
 import { parseSeedInput } from "./lib/csv";
-import { scoreLabel } from "./lib/scoring";
-import { canRunAutomatically, coverageLabel, safePublicWebsite, searchProgress } from "./lib/search";
+import { canRunAutomatically, coverageLabel, guidedSearchQueries, safePublicWebsite, searchProgress, shortfallExplanation } from "./lib/search";
 import type {
   Account,
   DashboardSnapshot,
@@ -19,6 +18,7 @@ import type {
   ResearchJob,
   SearchBrief,
   SearchRun,
+  SearchRunProgress,
   SearchRunSummary,
   SalesPlay
 } from "./types";
@@ -58,6 +58,19 @@ const formatDate = (value?: string) => {
 
 function Badge({ children, tone = "neutral" }: { children: React.ReactNode; tone?: string }) {
   return <span className={`badge badge-${tone}`}>{children}</span>;
+}
+
+/**
+ * Open a public URL in the user's browser, surfacing any refusal.
+ *
+ * Every call site used to be `void openUrl(...)`, which discards the promise.
+ * When the opener capability rejected a URL the click did nothing at all and
+ * reported nothing — indistinguishable from a dead button.
+ */
+function openExternal(url: string, onError: (message: string) => void) {
+  void openUrl(url).catch((reason) => {
+    onError(`Could not open ${url}. ${String(reason)}`);
+  });
 }
 
 function GlobalSearchProgress({ run, onOpen, onCancel }: { run: SearchRun; onOpen: () => void; onCancel: () => void }) {
@@ -114,9 +127,15 @@ function App() {
   useEffect(() => {
     if (!isDesktopRuntime) return;
     let unlisten: (() => void) | undefined;
-    void listen<SearchRun>("search-run-progress", (event) => {
-      setActiveRun((current) => !current || current.id === event.payload.id ? event.payload : current);
-      if (event.payload.status !== "running") void refresh();
+    // Progress carries counters only, so merge it into the run we already hold
+    // instead of replacing it. Reload the full run once, on completion.
+    void listen<SearchRunProgress>("search-run-progress", (event) => {
+      const progress = event.payload;
+      setActiveRun((current) => (current && current.id !== progress.id ? current : { ...(current as SearchRun), ...progress }));
+      if (progress.finished) {
+        void api.getSearchRun(progress.id).then(setActiveRun).catch(() => undefined);
+        void refresh();
+      }
     }).then((stop) => { unlisten = stop; });
     return () => unlisten?.();
   }, [refresh]);
@@ -153,6 +172,9 @@ function App() {
     }).catch((reason) => setError(String(reason)));
   }, [activeDraftJob, snapshot?.pendingJobs]);
 
+  // Safety net only. The `search-run-progress` event drives the UI; this covers
+  // the case where an emit is dropped (every emit is best-effort in the
+  // backend). It refetches the whole run, so it must stay infrequent.
   useEffect(() => {
     if (!isDesktopRuntime || activeRun?.status !== "running") return;
     const timer = window.setInterval(() => {
@@ -163,7 +185,7 @@ function App() {
           if (run.status !== "running") void refresh();
         })
         .catch((reason) => setError(String(reason)));
-    }, 1_000);
+    }, 10_000);
     return () => window.clearInterval(timer);
   }, [activeRun?.id, activeRun?.status, refresh]);
 
@@ -185,7 +207,7 @@ function App() {
     const timer = window.setInterval(() => void api.listJobs().then((jobs) => {
       const latest = jobs.find((job) => job.id === activeDraftJob.id);
       if (latest) setActiveDraftJob(latest);
-    }).catch((reason) => setError(String(reason))), 1_000);
+    }).catch((reason) => setError(String(reason))), 10_000);
     return () => window.clearInterval(timer);
   }, [activeDraftJob?.id, activeDraftJob?.status]);
 
@@ -363,7 +385,6 @@ function App() {
         {view === "discover" && (
           <DiscoverView
             key={discoverRevision}
-            seedImportDisabled={false}
             capabilities={snapshot?.sourceCapabilities ?? []}
             recentRuns={snapshot?.searchRuns ?? []}
             activeRun={activeRun}
@@ -408,6 +429,7 @@ function App() {
             selectedId={selectedId}
             busy={busy}
             draftJob={activeDraftJob}
+            onError={setError}
             onSelect={(id) => { setSelectedRunId(undefined); setSelectedId(id); }}
             onLibraryAction={(ids, action) => withBusy(`library-${action}`, async () => applyLibrary(ids, action))}
             onPermanentDelete={(ids) => withBusy("permanent-delete", async () => {
@@ -486,8 +508,7 @@ function SalesPlayEditor({ initial, busy, proposing, onPropose, onSave }: { init
   );
 }
 
-function DiscoverView({ seedImportDisabled, capabilities, recentRuns, activeRun, busy, onInterpret, onStart, onCancel, onClearRun, onOpenRun, onOpenAccount, onLibraryAction, onImport, onDiscover, onAddResults }: {
-  seedImportDisabled: boolean;
+function DiscoverView({ capabilities, recentRuns, activeRun, busy, onInterpret, onStart, onCancel, onClearRun, onOpenRun, onOpenAccount, onLibraryAction, onImport, onDiscover, onAddResults }: {
   capabilities: DashboardSnapshot["sourceCapabilities"];
   recentRuns: SearchRunSummary[];
   activeRun?: SearchRun;
@@ -517,6 +538,16 @@ function DiscoverView({ seedImportDisabled, capabilities, recentRuns, activeRun,
   const [searching, setSearching] = useState(false);
   const [clock, setClock] = useState(Date.now());
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set());
+  const planRef = useRef<HTMLElement>(null);
+
+  // The plan compiles instantly and offline, and renders below the prompt. On a
+  // short window that put it off-screen, so submitting looked like it did
+  // nothing at all. Move focus and view to the plan the moment it exists.
+  useEffect(() => {
+    if (!brief) return;
+    planRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    planRef.current?.focus({ preventScroll: true });
+  }, [brief?.id]);
 
   useEffect(() => setSelectedAccounts(new Set()), [activeRun?.id]);
 
@@ -577,11 +608,7 @@ function DiscoverView({ seedImportDisabled, capabilities, recentRuns, activeRun,
           : run.status === "cancelled"
             ? `Cancelled after ${elapsedLabel}`
             : `Search stopped after ${elapsedLabel}`;
-  const guidedQueries = brief ? [
-    `"${brief.segments[0]?.label ?? brief.productSummary}" company "about us" ${brief.geography}`,
-    `"${brief.positiveSignals[0]?.label ?? "hiring"}" business ${brief.geography}`,
-    `"${brief.customerOutcome}" company ${brief.geography}`
-  ] : [];
+  const guidedQueries = brief ? guidedSearchQueries(brief) : [];
   const automatic = canRunAutomatically(brief);
   const strongMatches = run?.accounts.filter((item) => item.resultTier === "strong") ?? [];
   const nearMatches = run?.accounts.filter((item) => item.resultTier === "near_match") ?? [];
@@ -590,7 +617,7 @@ function DiscoverView({ seedImportDisabled, capabilities, recentRuns, activeRun,
   const candidateSection = (title: string, items: SearchRun["accounts"], tone: "success" | "warning" | "neutral" = "neutral") => items.length ? <section className="candidate-section"><div className="candidate-section-heading"><h3>{title}</h3><Badge tone={tone}>{items.length}</Badge></div><div className="candidate-grid">{items.map((item) => <article key={item.account.id} className="candidate-card">
     <div className="candidate-card-top"><button type="button" className={selectedAccounts.has(item.account.id) ? "avatar selector selected" : "avatar selector"} aria-pressed={selectedAccounts.has(item.account.id)} aria-label={`Select ${item.account.name}`} onClick={() => setSelectedAccounts((current) => { const next = new Set(current); next.has(item.account.id) ? next.delete(item.account.id) : next.add(item.account.id); return next; })}>{selectedAccounts.has(item.account.id) ? "✓" : item.account.name.slice(0, 2).toUpperCase()}</button><div className="badge-row"><Badge tone={item.resultTier === "strong" ? "success" : item.resultTier === "excluded" ? "danger" : "warning"}>{item.resultTier.replaceAll("_", " ")}</Badge><Badge>{item.discoverySource}</Badge></div></div>
     <button type="button" className="candidate-body" onClick={() => onOpenAccount(item.account.id, run!.id)}><h3 title={item.account.name}>{item.account.name}</h3><p className="clamp-3" title={item.discoveryReason}>{item.discoveryReason}</p>{item.rejectionReasons[0] && <p className="candidate-caveat clamp-2" title={item.rejectionReasons[0]}>{item.rejectionReasons[0]}</p>}</button>
-    {safePublicWebsite(item.account.websiteUrl) && <button type="button" className="website-link" onClick={() => void openUrl(safePublicWebsite(item.account.websiteUrl)!)}>Website ↗</button>}
+    {safePublicWebsite(item.account.websiteUrl) && <button type="button" className="website-link" onClick={() => openExternal(safePublicWebsite(item.account.websiteUrl)!, setLocalError)}>Website ↗</button>}
     <div className="candidate-footer"><span><b>{item.score ?? "—"}</b> fit</span><span>Evidence: {item.evidenceConfidence}</span></div>
   </article>)}</div></section> : null;
 
@@ -611,10 +638,16 @@ function DiscoverView({ seedImportDisabled, capabilities, recentRuns, activeRun,
       {localError && <div className="alert error"><strong>Could not continue</strong><span>{localError}</span></div>}
     </section>
 
-    {brief && !run && <section className="search-receipt panel">
-      <div className="section-heading"><div><span className="step">Review</span><h2>Search plan</h2></div><Badge tone="warning">Approval required</Badge></div>
-      <p className="muted">Coverage: {coverageLabel(brief)} · Interpreter: instant deterministic rules</p>
-      <p className="receipt-summary">I’ll look for <strong>{brief.segments.map((item) => item.label).join(", ") || "user-supplied businesses"}</strong> in <strong>{brief.geography}</strong>. Qualification requires cited evidence matching the visible rules below.</p>
+    {brief && !run && <section className="search-receipt panel" ref={planRef} tabIndex={-1} aria-label="Search plan">
+      <div className="section-heading"><div><span className="step">Step 2 of 2</span><h2>Review this plan, then start</h2></div><Badge tone="warning">Nothing has run yet</Badge></div>
+      <p className="receipt-summary">Looking for <strong>{brief.segments.map((item) => item.label).join(", ") || "organizations matching your description"}</strong> in <strong>{brief.geography}</strong>, and keeping up to <strong>{brief.resultLimit}</strong> that public evidence actually supports.</p>
+      <div className="receipt-actions primary-first">
+        {automatic
+          ? <button className="button primary" disabled={busy === "search-run"} onClick={() => void onStart({ ...brief, approved: true })}>{busy === "search-run" ? "Starting…" : `Start search for up to ${brief.resultLimit} matches`}</button>
+          : <strong className="blocked-reason">This plan cannot run automatically — see below</strong>}
+        <button className="button ghost" onClick={() => setBrief(undefined)}>Edit the description</button>
+      </div>
+      <p className="muted">Sources: {coverageLabel(brief)}. Searching visits public websites; reviewing this plan does not.</p>
       <div className="receipt-grid">
         <div><span className="eyebrow">Outcome</span><p>{brief.customerOutcome}</p></div>
         <div><span className="eyebrow">Signals</span><div className="chip-row">{brief.positiveSignals.map((item) => <span className="chip" key={item.id}>{item.label}</span>)}</div></div>
@@ -624,9 +657,8 @@ function DiscoverView({ seedImportDisabled, capabilities, recentRuns, activeRun,
       <div className="lane-list">{brief.discoveryLanes.map((lane) => <div key={lane.id}><Badge tone={lane.mode === "automatic" ? "success" : "neutral"}>{lane.mode}</Badge><span><strong>{lane.label}</strong><small>{lane.reason} {lane.limitation}</small></span></div>)}</div>
       {brief.assumptions.length > 0 && <div className="assumption-box"><strong>Assumptions to review</strong><ul>{brief.assumptions.map((item) => <li key={item}>{item}</li>)}</ul></div>}
       <details className="advanced-brief"><summary>Edit boundaries</summary><div className="form-grid"><label>Geography<input value={brief.geography} onChange={(event) => setBrief({ ...brief, geography: event.target.value })} /></label><label>Qualification threshold<input type="number" min={1} max={100} value={brief.qualificationThreshold} onChange={(event) => setBrief({ ...brief, qualificationThreshold: Number(event.target.value) })} /></label><label>Maximum primary score span<input type="number" min={0} max={20} value={brief.qualityBand} onChange={(event) => setBrief({ ...brief, qualityBand: Number(event.target.value) })} /></label><label className="span-2">Exclusions<textarea value={brief.exclusions.join("\n")} onChange={(event) => setBrief({ ...brief, exclusions: splitList(event.target.value) })} /></label></div></details>
-      <div className="receipt-actions"><button className="button ghost" onClick={() => setBrief(undefined)}>Revise query</button>{automatic && <button className="button primary" disabled={busy === "search-run"} onClick={() => void onStart({ ...brief, approved: true })}>{busy === "search-run" ? "Starting…" : `Find up to ${brief.resultLimit} strong matches`}</button>}</div>
-      {!automatic && <div className="coverage-callout"><strong>Automatic coverage is unavailable for this query</strong><p>The enabled free directories cannot reliably discover this audience. Open a guided search below, then paste selected company websites here. No search-result page will be scraped.</p><textarea value={raw} onChange={(event) => setRaw(event.target.value)} placeholder={'https://company-one.example\nhttps://company-two.example'} /><button className="button secondary" disabled={seedImportDisabled || busy === "import"} onClick={() => onImport(raw)}>Import selected websites</button><small>For automated general-web discovery, configure your own free local SearXNG instance in Setup.</small></div>}
-      {guidedQueries.length > 0 && <div className="query-list">{guidedQueries.map((item) => <button type="button" key={item} onClick={() => void openUrl(`https://duckduckgo.com/?q=${encodeURIComponent(item)}`)}><span>{item}</span><b>Open ↗</b></button>)}</div>}
+      {!automatic && <div className="coverage-callout"><strong>No curated directory covers this audience</strong><p>Automatic discovery samples OpenStreetMap, which maps physical businesses — trades, professional and healthcare practices, automotive, hospitality, retail and consumer services. Nothing in it matches this description, and the workbench will not guess at a source query rather than say so.</p><p>Two routes still work, and both feed the same evidence, scoring, and drafting: open a guided search below and paste the company websites you pick, or import a list directly. Results you add this way are researched and qualified exactly like automatic ones. No search-result page is ever scraped.</p><textarea value={raw} onChange={(event) => setRaw(event.target.value)} placeholder={'https://company-one.example\nhttps://company-two.example'} /><button className="button secondary" disabled={busy === "import"} onClick={() => onImport(raw)}>Import selected websites</button><small>For automated general-web discovery, configure your own free local SearXNG instance in Setup.</small></div>}
+      {guidedQueries.length > 0 && <div className="query-list">{guidedQueries.map((item) => <button type="button" key={item} onClick={() => openExternal(`https://duckduckgo.com/?q=${encodeURIComponent(item)}`, setLocalError)}><span>{item}</span><b>Open ↗</b></button>)}</div>}
     </section>}
 
     {run && <section className="run-panel panel">
@@ -638,7 +670,7 @@ function DiscoverView({ seedImportDisabled, capabilities, recentRuns, activeRun,
       {run.status === "running" && <button className="button ghost" disabled={busy === "cancel-run"} onClick={onCancel}>Cancel search</button>}
       {selectableAccounts.length > 0 && <button className="select-all result-select-all" onClick={() => setSelectedAccounts(selectedAccounts.size === selectableAccounts.length ? new Set() : new Set(selectableAccounts.map((item) => item.account.id)))}>{selectedAccounts.size === selectableAccounts.length ? "Clear visible selection" : "Select all visible matches"}</button>}
       {selectedAccounts.size > 0 && <div className="bulk-toolbar"><strong>{selectedAccounts.size} selected</strong><button onClick={() => onLibraryAction([...selectedAccounts], "save")}>Save</button><button onClick={() => onLibraryAction([...selectedAccounts], "favorite")}>Favorite</button><button className="danger-text" onClick={() => onLibraryAction([...selectedAccounts], "trash")}>Move to Trash</button><button onClick={() => setSelectedAccounts(new Set())}>Clear</button></div>}
-      {run.status === "running" ? candidateSection("Candidates being evaluated", run.accounts) : <><div className="result-summary"><strong>{run.strongCount} strong match{run.strongCount === 1 ? "" : "es"}</strong><span>Discovered {run.candidateCount} · Researched {run.researchedCount} · Requested up to {run.resultLimit}</span>{run.strongCount < run.resultLimit && <small>The app returned fewer results because the remaining candidates did not meet the score and evidence band.</small>}</div>{candidateSection("Strong Matches", strongMatches, "success")}{candidateSection("Near Matches", nearMatches, "warning")}{excluded.length > 0 && <details className="excluded-results"><summary>Excluded or failed diagnostics ({excluded.length})</summary>{candidateSection("Excluded or Failed", excluded)}</details>}</>}
+      {run.status === "running" ? candidateSection("Candidates being evaluated", run.accounts) : <><div className="result-summary"><strong>{run.strongCount} strong match{run.strongCount === 1 ? "" : "es"}</strong><span>Discovered {run.candidateCount} · Researched {run.researchedCount} · Requested up to {run.resultLimit}</span>{run.strongCount < run.resultLimit && <small>{shortfallExplanation(run)}</small>}</div>{candidateSection("Strong Matches", strongMatches, "success")}{candidateSection("Near Matches", nearMatches, "warning")}{excluded.length > 0 && <details className="excluded-results"><summary>Excluded or failed diagnostics ({excluded.length})</summary>{candidateSection("Excluded or Failed", excluded)}</details>}</>}
       {!run.accounts.length && run.status !== "running" && <p className="muted">No automatic candidates were returned. Use the guided or seeded routes; the workbench will not fill the list with unsupported matches.</p>}
       {run.status !== "running" && <button className="button primary" onClick={() => { setBrief(undefined); setSelectedAccounts(new Set()); onClearRun(); }}>Start another search</button>}
     </section>}
@@ -646,15 +678,15 @@ function DiscoverView({ seedImportDisabled, capabilities, recentRuns, activeRun,
     {!run && recentRuns.length > 0 && <section className="panel"><h3>Recent searches</h3><div className="recent-runs">{recentRuns.slice(0, 5).map((item) => <button key={item.id} onClick={() => void onOpenRun(item.id)}><span><strong>{item.query}</strong><small>{item.strongCount} strong · {item.qualifiedCount} qualified · {item.reviewCount} review</small></span><Badge>{item.status}</Badge></button>)}</div></section>}
 
     <details className="alternate-routes panel"><summary>Seeded and source-specific discovery</summary><div className="page-grid discover-grid">
-      <section><h3>Import domains or CSV</h3><p>Contact details remain labeled as user-supplied evidence.</p>{seedImportDisabled && <p className="muted">Add a minimal approved offer in Setup before seed import.</p>}<textarea className="seed-input" value={raw} onChange={(event) => setRaw(event.target.value)} placeholder={'example.com\nacme.test\n\n—or—\nCompany,Website,Person,Job Title,Work Email,Business Phone'} /><button className="button secondary wide" disabled={seedImportDisabled || busy === "import"} onClick={() => onImport(raw)}>Import seeds</button></section>
+      <section><h3>Import domains or CSV</h3><p>Contact details remain labeled as user-supplied evidence.</p><textarea className="seed-input" value={raw} onChange={(event) => setRaw(event.target.value)} placeholder={'example.com\nacme.test\n\n—or—\nCompany,Website,Person,Job Title,Work Email,Business Phone'} /><button className="button secondary wide" disabled={busy === "import"} onClick={() => onImport(raw)}>Import seeds</button></section>
       <section><h3>Search a specific public source</h3><form className="inline-form" onSubmit={discoverSource}><select value={source} onChange={(event) => setSource(event.target.value)}><option value="sec">SEC EDGAR</option><option value="usaspending">USAspending</option><option value="searxng">Local SearXNG</option></select><input value={query} onChange={(event) => setQuery(event.target.value)} required placeholder="Company or recipient name" /><button className="button secondary" disabled={searching}>{searching ? "Searching…" : "Search"}</button></form>{sourceResults.length > 0 && <div className="result-list">{sourceResults.map((result, index) => <label key={`${result.source}-${result.externalId ?? index}`}><input type="checkbox" checked={selected.has(index)} onChange={() => setSelected((current) => { const next = new Set(current); next.has(index) ? next.delete(index) : next.add(index); return next; })} /><span><strong>{result.companyName}</strong><small>{result.reason}</small></span><Badge>{result.source}</Badge></label>)}<button className="button primary" onClick={() => onAddResults(sourceResults.filter((_, index) => selected.has(index)))}>Add selected</button></div>}</section>
     </div><div className="capability-row">{capabilities.map((capability) => <Badge key={capability.id} tone={capability.enabled ? "success" : "neutral"}>{capability.name}: {capability.enabled ? "ready" : "optional"}</Badge>)}</div></details>
     <p className="attribution">Automatic mapped-business discovery uses © OpenStreetMap contributors, available under ODbL. Coverage varies.</p>
   </div>;
 }
 
-function ProspectsView({ accounts, selected, selectedId, busy, draftJob, onSelect, onLibraryAction, onPermanentDelete, onResearch, onGenerate, onOutcome, onSuppress }: {
-  accounts: Account[]; selected?: ProspectPackage; selectedId?: string; busy?: string; draftJob?: ResearchJob;
+function ProspectsView({ accounts, selected, selectedId, busy, draftJob, onError, onSelect, onLibraryAction, onPermanentDelete, onResearch, onGenerate, onOutcome, onSuppress }: {
+  accounts: Account[]; selected?: ProspectPackage; selectedId?: string; busy?: string; draftJob?: ResearchJob; onError: (message: string) => void;
   onSelect: (id: string) => void; onLibraryAction: (ids: string[], action: LibraryAction) => void; onPermanentDelete: (ids: string[]) => void;
   onResearch: () => void; onGenerate: (kind?: "initial" | "follow_up") => void; onOutcome: (outcome: OutcomeKind) => void; onSuppress: (suppressed: boolean) => void;
 }) {
@@ -675,12 +707,12 @@ function ProspectsView({ accounts, selected, selectedId, busy, draftJob, onSelec
       {checked.size > 0 && <div className="bulk-toolbar compact"><strong>{checked.size} selected</strong>{filter === "trash" ? <><button onClick={() => onLibraryAction([...checked], "restore")}>Restore</button><button className="danger-text" onClick={() => { if (confirm("Permanently delete the selected trashed prospects and all related evidence?")) onPermanentDelete([...checked]); }}>Delete permanently</button></> : <><button onClick={() => onLibraryAction([...checked], "save")}>Save</button><button onClick={() => onLibraryAction([...checked], "unsave")}>Unsave</button><button onClick={() => onLibraryAction([...checked], "favorite")}>Favorite</button><button onClick={() => onLibraryAction([...checked], "unfavorite")}>Unfavorite</button><button className="danger-text" onClick={() => onLibraryAction([...checked], "trash")}>Trash</button></>}</div>}
       {visible.map((account) => <article key={account.id} className={selectedId === account.id ? "account-row selected" : "account-row"}>
         <button type="button" className={checked.has(account.id) ? "avatar selector selected" : "avatar selector"} aria-pressed={checked.has(account.id)} aria-label={`Select ${account.name}`} onClick={() => setChecked((current) => { const next = new Set(current); next.has(account.id) ? next.delete(account.id) : next.add(account.id); return next; })}>{checked.has(account.id) ? "✓" : account.name.slice(0, 2).toUpperCase()}</button>
-        <button type="button" className="account-open" onClick={() => onSelect(account.id)}><span className="account-meta"><strong title={account.name}>{account.name}</strong><small title={account.domain ?? account.websiteUrl}>{account.domain ?? account.websiteUrl ?? "Public-source account"}</small></span><span className="score"><b>{account.score ?? "—"}</b><small>{scoreLabel(account.score)}</small></span></button>
+        <button type="button" className="account-open" onClick={() => onSelect(account.id)}><span className="account-meta"><strong title={account.name}>{account.name}</strong><small title={account.domain ?? account.websiteUrl}>{account.domain ?? account.websiteUrl ?? "Public-source account"}</small></span><span className="score"><b>{account.score ?? "—"}</b><small>{account.scoreLabel ?? "Not scored"}</small></span></button>
       </article>)}
       {!visible.length && <p className="muted library-empty">No prospects in this view.</p>}
     </section>
     <section className="prospect-detail">{!selected ? <div className="panel skeleton">Select a prospect to review its full record.</div> : <>
-      <div className="panel detail-hero"><div><span className="eyebrow">{selected.account.domain ?? "Public record"}</span><h2>{selected.account.name}</h2>{safePublicWebsite(selected.account.websiteUrl) && <button className="website-link prominent" onClick={() => void openUrl(safePublicWebsite(selected.account.websiteUrl)!)}>Open website ↗</button>}<div className="badge-row"><Badge tone={selected.suppressed || selected.account.trashedAt ? "danger" : "success"}>{selected.account.trashedAt ? "In trash" : selected.suppressed ? "Do not contact" : selected.discoveryContext?.state.replaceAll("_", " ") ?? selected.account.status.replaceAll("_", " ")}</Badge><Badge>{selected.account.savedAt ? "Saved" : "Unsaved discovery"}</Badge>{selected.account.favoritedAt && <Badge tone="warning">Favorite</Badge>}{selected.account.location && <Badge>{selected.account.location}</Badge>}{selected.account.industry && <Badge>{selected.account.industry}</Badge>}<Badge>{selected.evidence.length} evidence items</Badge></div></div><div className="hero-score"><strong>{assessment?.total ?? selected.account.score ?? "—"}</strong><span>fit score</span></div></div>
+      <div className="panel detail-hero"><div><span className="eyebrow">{selected.account.domain ?? "Public record"}</span><h2>{selected.account.name}</h2>{safePublicWebsite(selected.account.websiteUrl) && <button className="website-link prominent" onClick={() => openExternal(safePublicWebsite(selected.account.websiteUrl)!, onError)}>Open website ↗</button>}<div className="badge-row"><Badge tone={selected.suppressed || selected.account.trashedAt ? "danger" : "success"}>{selected.account.trashedAt ? "In trash" : selected.suppressed ? "Do not contact" : selected.discoveryContext?.state.replaceAll("_", " ") ?? selected.account.status.replaceAll("_", " ")}</Badge><Badge>{selected.account.savedAt ? "Saved" : "Unsaved discovery"}</Badge>{selected.account.favoritedAt && <Badge tone="warning">Favorite</Badge>}{selected.account.location && <Badge>{selected.account.location}</Badge>}{selected.account.industry && <Badge>{selected.account.industry}</Badge>}<Badge>{selected.evidence.length} evidence items</Badge></div></div><div className="hero-score"><strong>{assessment?.total ?? selected.account.score ?? "—"}</strong><span>fit score</span></div></div>
       <div className="action-strip"><button className="button secondary" disabled={busy === "research" || Boolean(selected.account.trashedAt)} onClick={onResearch}>{busy === "research" ? "Researching…" : "Refresh public evidence"}</button><button className="button primary" disabled={selected.suppressed || Boolean(selected.account.trashedAt) || generating || busy === "draft-readiness" || !selected.evidence.length} onClick={() => onGenerate("initial")}>{generating ? `${draftJob?.progressPercent}% · ${draftJob?.progressStage}` : "Generate with Ollama"}</button>{selected.draft && <button className="button secondary" disabled={selected.suppressed || Boolean(selected.account.trashedAt) || generating} onClick={() => onGenerate("follow_up")}>Draft requested follow-up</button>}<button className="button ghost danger-text" disabled={Boolean(selected.account.trashedAt)} onClick={() => onSuppress(!selected.suppressed)}>{selected.suppressed ? "Remove suppression" : "Do not contact"}</button></div>
       <div className="detail-grid">
         {selected.discoveryContext && <section className="panel span-2 discovery-context"><div className="section-heading"><div><span className="step">Discovery context</span><h3>{selected.discoveryContext.resultTier.replaceAll("_", " ")}</h3></div><Badge>{selected.discoveryContext.evidenceConfidence} confidence</Badge></div><p><b>Search:</b> {selected.discoveryContext.query}</p><p><b>Source:</b> {selected.discoveryContext.discoverySource}</p><p><b>Why it appeared:</b> {selected.discoveryContext.discoveryReason}</p>{selected.discoveryContext.rejectionReasons.length > 0 && <><b>Caveats</b><ul>{selected.discoveryContext.rejectionReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></>}<b>All matched features</b>{selected.discoveryContext.matchedFeatures.length ? <ul>{selected.discoveryContext.matchedFeatures.map((feature) => <li key={feature.ruleId}>{feature.label} · {feature.pointsAwarded} points · {feature.confidence} confidence</li>)}</ul> : <p>No supported qualification features were found.</p>}</section>}
@@ -690,15 +722,10 @@ function ProspectsView({ accounts, selected, selectedId, busy, draftJob, onSelec
         <section className="panel span-2"><h3>Email draft</h3>{selected.draft ? <div className="draft"><div className="subject"><span>Subject</span><strong>{selected.draft.subject}</strong><Badge tone={selected.draft.verified ? "success" : "danger"}>{selected.draft.verified ? "Verified" : "Blocked"}</Badge></div><pre>{selected.draft.body}</pre></div> : <p className="muted">No draft yet. Research the account, then generate with the local model.</p>}</section>
         <section className="panel"><h3>Call brief</h3>{selected.callBrief ? <div className="call-brief"><p><b>Opener</b>{selected.callBrief.opener}</p><p><b>Reason now</b>{selected.callBrief.reasonNow}</p><b>Labeled hypotheses</b><ol>{selected.callBrief.hypotheses.map((hypothesis) => <li key={hypothesis}>{hypothesis}</li>)}</ol><b>Discovery questions</b><ol>{selected.callBrief.discoveryQuestions.map((question) => <li key={question}>{question}</li>)}</ol><b>Relevant proof</b><ul>{selected.callBrief.relevantProof.map((proof) => <li key={proof}>{proof}</li>)}</ul><b>Likely objections</b><ul>{selected.callBrief.likelyObjections.map((objection) => <li key={objection}>{objection}</li>)}</ul><p><b>Desired outcome</b>{selected.callBrief.desiredOutcome}</p></div> : <p className="muted">No call brief yet.</p>}</section>
         <section className="panel"><h3>Manual outcome</h3><div className="outcome-grid">{(["contacted", "replied", "meeting", "not_interested", "wrong_fit", "do_not_contact"] as OutcomeKind[]).map((outcome) => <button className={selected.latestOutcome === outcome ? "selected" : ""} onClick={() => onOutcome(outcome)} key={outcome}>{outcome.replaceAll("_", " ")}</button>)}</div></section>
-        <section className="panel span-2"><h3>Evidence ledger</h3>{selected.evidence.length ? <div className="evidence-list">{selected.evidence.map((item, index) => <details key={item.id} open={index === 0}><summary><span><Badge>{item.sourceKind}</Badge><strong>{item.title}</strong>{item.qualityFlags.map((flag) => <Badge key={flag} tone={flag === "contradictory" ? "danger" : "warning"}>{flag}</Badge>)}</span><small>{formatDate(item.retrievedAt)} · {item.freshness}</small></summary><p>{item.excerpt}</p><button className="link-button" onClick={() => item.sourceUrl.startsWith("http") && void openUrl(item.sourceUrl)}>Open source ↗</button></details>)}</div> : <p className="muted">No evidence collected.</p>}</section>
+        <section className="panel span-2"><h3>Evidence ledger</h3>{selected.evidence.length ? <div className="evidence-list">{selected.evidence.map((item, index) => <details key={item.id} open={index === 0}><summary><span><Badge>{item.sourceKind}</Badge><strong>{item.title}</strong>{item.qualityFlags.map((flag) => <Badge key={flag} tone={flag === "contradictory" ? "danger" : "warning"}>{flag}</Badge>)}</span><small>{formatDate(item.retrievedAt)} · {item.freshness}</small></summary><p>{item.excerpt}</p><button className="link-button" onClick={() => { const target = safePublicWebsite(item.sourceUrl); if (target) openExternal(target, onError); else onError(`This evidence has no public web address: ${item.sourceUrl}`); }}>Open source ↗</button></details>)}</div> : <p className="muted">No evidence collected.</p>}</section>
       </div>
     </>}</section>
   </div>;
-}
-
-function DigestView({ accounts, pendingJobs, onOpen }: { accounts: Account[]; pendingJobs: number; onOpen: (id: string) => void }) {
-  const ranked = [...accounts].filter((account) => account.researchedAt).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  return <div className="page-grid"><section className="metric-grid span-2"><div><strong>{ranked.length}</strong><span>researched</span></div><div><strong>{ranked.filter((a) => (a.score ?? 0) >= 75).length}</strong><span>strong fits</span></div><div><strong>{pendingJobs}</strong><span>queued jobs</span></div><div><strong>{ranked.filter((a) => a.status === "needs_review").length}</strong><span>need review</span></div></section><section className="panel span-2"><div className="section-heading"><div><span className="step">Today</span><h2>Ranked attention queue</h2></div><p>Generated locally from the latest available evidence.</p></div>{ranked.length ? ranked.map((account) => <button className="digest-row" onClick={() => onOpen(account.id)} key={account.id}><span><strong>{account.name}</strong><small>Researched {formatDate(account.researchedAt)}</small></span><span className="score"><b>{account.score ?? "—"}</b><small>{scoreLabel(account.score)}</small></span></button>) : <p className="muted">Research an account to populate the digest.</p>}</section></div>;
 }
 
 function DraftSetupDialog({ readiness, busy, onCancel, onSubmit }: { readiness: DraftReadiness; busy: boolean; onCancel: () => void; onSubmit: (play: SalesPlay, overrideReview: boolean) => void }) {

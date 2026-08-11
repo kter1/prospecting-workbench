@@ -204,6 +204,30 @@ pub struct SearchRun {
     pub accounts: Vec<SearchRunAccount>,
 }
 
+/// Payload for the `search-run-progress` event.
+///
+/// Progress fires once per researched candidate. Emitting a full `SearchRun`
+/// meant re-reading and re-parsing every candidate in the pool on every tick,
+/// which is quadratic in pool size and sends megabytes over IPC. The UI keeps
+/// its accounts and fetches pages on demand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchRunProgress {
+    pub id: String,
+    pub status: String,
+    pub progress_completed: i64,
+    pub progress_total: i64,
+    pub progress_percent: i64,
+    pub progress_stage: String,
+    pub result_limit: i64,
+    pub candidate_count: i64,
+    pub researched_count: i64,
+    pub strong_count: i64,
+    pub near_match_count: i64,
+    /// True once the run reaches a terminal state, so the UI knows to reload.
+    pub finished: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRunSummary {

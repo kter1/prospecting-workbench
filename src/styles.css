@@ -230,6 +230,13 @@ input:focus, textarea:focus, select:focus { border-color: #77a88b; box-shadow: 0
 .advanced-brief summary, .alternate-routes > summary { cursor: pointer; color: var(--green-dark); font-size: 11px; font-weight: 700; }
 .advanced-brief[open] summary { margin-bottom: 12px; }
 .receipt-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 18px; }
+/* The plan renders below the prompt, so its primary action leads rather than
+   sitting at the bottom of a long panel where it reads as "nothing happened". */
+.receipt-actions.primary-first { justify-content: flex-start; align-items: center; margin: 14px 0 4px; }
+.receipt-actions.primary-first .button.primary { font-size: 13px; padding: 11px 20px; }
+.search-receipt:focus { outline: none; }
+.search-receipt:focus-visible { outline: 2px solid var(--accent, #3b6ef5); outline-offset: 3px; }
+.blocked-reason { color: #8a5a1c; font-size: 12px; }
 .run-metric { display: grid !important; gap: 2px !important; text-align: right; }
 .run-metric strong { font: 500 20px "DM Mono", monospace; }
 .run-metric span { color: var(--muted); font-size: 8px; text-transform: uppercase; }

@@ -1,11 +1,14 @@
 mod adapters;
 mod ai;
+mod catalog;
 mod db;
 mod error;
 mod models;
 mod qualification;
+mod regions;
 mod research;
 mod safety;
+mod wikidata;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -38,16 +41,12 @@ impl AppState {
 #[tauri::command]
 fn bootstrap_app(state: State<'_, AppState>) -> AppResult<DashboardSnapshot> {
     let connection = state.connection()?;
-    connection.execute(
-        "UPDATE evidence SET freshness=CASE
-           WHEN julianday('now')-julianday(retrieved_at) > 90 THEN 'stale'
-           WHEN julianday('now')-julianday(retrieved_at) > 30 THEN 'aging'
-           ELSE 'fresh' END",
-        [],
-    )?;
-    for account in db::list_accounts(&connection)? {
-        db::update_quality_flags(&connection, &account.id)?;
-    }
+    // Freshness is a pure function of `retrieved_at`, so it is derived in the
+    // read query rather than persisted. This used to rewrite the entire
+    // evidence table and then recompute quality flags for every account on
+    // every bootstrap — and the frontend bootstraps on mount, after each search
+    // run, after each draft, after imports and deletes, and hourly. Flags are
+    // recomputed on the write path, where evidence actually changes.
     db::recover_interrupted_jobs(&connection)?;
     let pending_jobs = connection.query_row(
         "SELECT count(*) FROM jobs WHERE status='pending'",
@@ -117,8 +116,7 @@ async fn interpret_prospecting_query(
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().chars().take(500).collect::<String>());
     let play = db::load_sales_play(&*state.connection()?)?;
-    let (mut brief, _) = ai::interpret_search_brief(
-        &state.client,
+    let mut brief = ai::interpret_search_brief(
         &clean_query,
         product_reference.as_deref(),
         &geography,
@@ -166,11 +164,7 @@ async fn start_search_run(
                 let _ =
                     db::finish_search_run(&connection, &run_id, "failed", Some(&error.to_string()));
             }
-            if let Ok(connection) = background.connection() {
-                if let Ok(run) = db::get_search_run(&connection, &run_id) {
-                    let _ = app.emit("search-run-progress", run);
-                }
-            }
+            let _ = publish_search_finished(&background, &app, &run_id);
         }
     });
     Ok(run)
@@ -247,60 +241,6 @@ async fn research_account(
             Err(error)
         }
     }
-}
-
-#[tauri::command]
-async fn generate_prospect_package(
-    state: State<'_, AppState>,
-    account_id: String,
-    provider: String,
-    kind: String,
-    override_review: bool,
-) -> AppResult<ProspectPackage> {
-    let (package, play) = {
-        let connection = state.connection()?;
-        (
-            db::get_package(&connection, &account_id)?,
-            db::require_approved_play(&connection)?,
-        )
-    };
-    if package.account.trashed_at.is_some() {
-        return Err(AppError::Message(
-            "Restore this prospect from Trash before generating a draft.".into(),
-        ));
-    }
-    if package.suppressed {
-        return Err(AppError::Message(
-            "This prospect is suppressed. Unsuppress it before generating a draft.".into(),
-        ));
-    }
-    let latest_state = db::latest_search_state(&*state.connection()?, &account_id)?
-        .unwrap_or_else(|| package.account.status.clone());
-    if !draft_status_allowed(&latest_state, override_review) {
-        return Err(AppError::Message(
-            "This account is not qualified. Review its evidence and use an explicit override if you still want a draft.".into(),
-        ));
-    }
-    let (assessment, draft, brief) =
-        ai::generate(&state.client, &package, &play, &provider, &kind).await?;
-    let evidence_ids = package
-        .evidence
-        .iter()
-        .map(|item| item.id.clone())
-        .collect::<Vec<_>>();
-    {
-        let connection = state.connection()?;
-        db::save_account(&connection, &account_id)?;
-        db::save_generated_package(
-            &connection,
-            &account_id,
-            &assessment,
-            &draft,
-            &brief,
-            &evidence_ids,
-        )?;
-    }
-    db::get_package(&*state.connection()?, &account_id)
 }
 
 fn default_sales_play(package: &ProspectPackage) -> SalesPlay {
@@ -909,6 +849,12 @@ async fn process_search_candidate(
     Ok(())
 }
 
+/// Emit a progress tick.
+///
+/// Deliberately carries counters only. This fires once per researched
+/// candidate, so reading the full run here made the cost of each tick grow
+/// with the pool already researched — quadratic overall, and megabytes of IPC
+/// per tick at high candidate targets. The UI pages accounts in separately.
 fn publish_search_progress(
     state: &AppState,
     app: &AppHandle,
@@ -916,13 +862,120 @@ fn publish_search_progress(
     percent: i64,
     stage: &str,
 ) -> AppResult<()> {
-    let run = {
+    let progress = {
         let connection = state.connection()?;
         db::set_search_run_stage(&connection, run_id, percent, stage)?;
-        db::get_search_run(&connection, run_id)?
+        db::get_search_run_progress(&connection, run_id)?
     };
-    let _ = app.emit("search-run-progress", run);
+    let _ = app.emit("search-run-progress", progress);
     Ok(())
+}
+
+/// Emit the terminal tick for a run that has reached a final state.
+fn publish_search_finished(state: &AppState, app: &AppHandle, run_id: &str) -> AppResult<()> {
+    let progress = db::get_search_run_progress(&*state.connection()?, run_id)?;
+    let _ = app.emit("search-run-progress", progress);
+    Ok(())
+}
+
+/// Record a source backoff when an adapter reports `RATE_LIMIT:<source>:<secs>:`.
+///
+/// Both the map and reference-data lanes encode throttling in the error string,
+/// and both must leave a persistent backoff so the next run does not walk
+/// straight back into it.
+fn record_rate_limit_backoff(state: &AppState, source: &str, error: &AppError) -> AppResult<()> {
+    let message = error.to_string();
+    let prefix = format!("RATE_LIMIT:{source}:");
+    if let Some(rest) = message.strip_prefix(&prefix) {
+        let mut parts = rest.splitn(2, ':');
+        let seconds = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60);
+        let detail = parts.next().unwrap_or(&message);
+        db::set_source_backoff(&*state.connection()?, source, seconds, detail)?;
+    }
+    Ok(())
+}
+
+/// Resolve the description to organization classes, then collect U.S.
+/// organizations of those types.
+///
+/// The resolved class is recorded as a run warning so the user can see exactly
+/// what the search was interpreted as before reviewing any candidate.
+async fn resolve_and_discover_reference_data(
+    state: &AppState,
+    run_id: &str,
+    query: &str,
+    terms: &str,
+    limit: usize,
+    rotation: usize,
+) -> AppResult<Vec<DiscoveryResult>> {
+    // A description names a need, not a directory heading. The local model
+    // proposes the kinds of organization that serve it, and those go first
+    // because they are far likelier to be real Wikidata classes than raw
+    // keywords from the sentence. Keyword pairs remain the offline fallback.
+    let mut phrases = ai::propose_audience_types(&state.client, query)
+        .await
+        .unwrap_or_default();
+    let proposed = phrases.clone();
+    phrases.extend(wikidata::candidate_phrases(terms));
+
+    let classes = wikidata::resolve_classes(&state.client, &phrases).await?;
+    if classes.is_empty() {
+        // Say exactly what was tried. "No usable candidates" on its own gives
+        // the user nothing to act on.
+        db::add_search_warning(
+            &*state.connection()?,
+            run_id,
+            SourceWarning {
+                source: "Open reference data".into(),
+                message: format!(
+                    "Could not match this description to a known type of organization. Tried: {}. Naming the kind of organization you want (for example \"talent agency\" or \"literary agency\") usually resolves it.",
+                    phrases.join(", ")
+                ),
+                used_cached_results: false,
+                cache_age_hours: None,
+            },
+        )?;
+        return Ok(Vec::new());
+    }
+    if !proposed.is_empty() {
+        db::add_search_warning(
+            &*state.connection()?,
+            run_id,
+            SourceWarning {
+                source: "Open reference data".into(),
+                message: format!(
+                    "Your description was read as needing: {}. Those were looked up in open reference data.",
+                    proposed.join(", ")
+                ),
+                used_cached_results: false,
+                cache_age_hours: None,
+            },
+        )?;
+    }
+    let summary = classes
+        .iter()
+        .map(|class| class.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    db::add_search_warning(
+        &*state.connection()?,
+        run_id,
+        SourceWarning {
+            source: "Open reference data".into(),
+            message: format!(
+                "\"{terms}\" was interpreted as: {summary}. Organizations were collected from Wikidata on that basis; review the match before trusting the results."
+            ),
+            used_cached_results: false,
+            cache_age_hours: None,
+        },
+    )?;
+    // Rotation pages deeper into the same class so a repeat search surfaces
+    // organizations the previous run did not reach.
+    let offset = rotation.saturating_mul(limit.max(1)) % 1_000;
+    wikidata::discover_instances(&state.client, &classes, limit, offset).await
 }
 
 async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> AppResult<()> {
@@ -933,6 +986,9 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
     };
     publish_search_progress(state, app, run_id, 2, "Preparing enabled sources")?;
     let candidate_budget = (brief.result_limit * 5).max(30).clamp(1, 100) as usize;
+    // Shifts which bounded regions this run samples first. Without it, repeat
+    // searches re-sample one bounding box and return the same companies.
+    let rotation = db::search_rotation(&*state.connection()?, run_id)?;
     let mut results = Vec::new();
     let automatic_lanes = brief
         .discovery_lanes
@@ -957,8 +1013,10 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
                     .filter_map(|segment| segment.discovery_category.clone())
                     .collect::<Vec<_>>();
                 categories.sort();
+                // The rotation is part of the key so a repeat search reads its
+                // own sample rather than replaying the previous run's cache.
                 let cache_key = format!(
-                    "overpass:{}:{}",
+                    "overpass:{}:{}:r{rotation}",
                     brief.geography.trim().to_ascii_lowercase(),
                     categories.join(",")
                 );
@@ -988,17 +1046,48 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
                         &categories,
                         &brief.geography,
                         candidate_budget,
+                        rotation,
                     )
                     .await
                     {
-                        Ok(found) => {
+                        Ok(outcome) => {
+                            // Partial throttling: some mirrors limited us but
+                            // others answered. Record the backoff anyway so the
+                            // next run does not walk straight back into it.
+                            if let Some(seconds) = outcome.rate_limited {
+                                db::set_source_backoff(
+                                    &*state.connection()?,
+                                    "overpass",
+                                    seconds,
+                                    "A public Overpass mirror rate-limited part of this search.",
+                                )?;
+                            }
+                            // A sample too large to parse means real results
+                            // were discarded. Say which ones, rather than
+                            // letting the highest-yield regions vanish.
+                            if !outcome.oversized_samples.is_empty() {
+                                db::add_search_warning(
+                                    &*state.connection()?,
+                                    run_id,
+                                    SourceWarning {
+                                        source: "OpenStreetMap Overpass".into(),
+                                        message: format!(
+                                            "{} sample(s) were larger than the parse limit and were skipped: {}. Narrow the geography to cover them.",
+                                            outcome.oversized_samples.len(),
+                                            outcome.oversized_samples.join("; ")
+                                        ),
+                                        used_cached_results: false,
+                                        cache_age_hours: None,
+                                    },
+                                )?;
+                            }
                             db::cache_discoveries(
                                 &*state.connection()?,
                                 &cache_key,
                                 "overpass",
-                                &found,
+                                &outcome.results,
                             )?;
-                            Ok(found)
+                            Ok(outcome.results)
                         }
                         Err(error) => {
                             let message = error.to_string();
@@ -1031,6 +1120,57 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
                             } else {
                                 Err(error)
                             }
+                        }
+                    }
+                }
+            }
+            "wikidata" => {
+                let terms = ai::reference_terms(&brief.query);
+                let cache_key = format!("wikidata:{terms}:r{rotation}");
+                let cached = db::cached_discoveries(&*state.connection()?, &cache_key)?;
+                let backoff = db::source_backoff(&*state.connection()?, "wikidata")?;
+                if let Some((cached_results, _age)) = cached.as_ref().filter(|(_, age)| *age < 24) {
+                    Ok(cached_results.clone())
+                } else if let Some(message) = backoff {
+                    match cached {
+                        Some((cached_results, age)) => {
+                            db::add_search_warning(
+                                &*state.connection()?,
+                                run_id,
+                                SourceWarning {
+                                    source: "Open reference data".into(),
+                                    message,
+                                    used_cached_results: true,
+                                    cache_age_hours: Some(age),
+                                },
+                            )?;
+                            Ok(cached_results)
+                        }
+                        None => Err(AppError::Message(message)),
+                    }
+                } else {
+                    match resolve_and_discover_reference_data(
+                        state,
+                        run_id,
+                        &brief.query,
+                        &terms,
+                        candidate_budget,
+                        rotation,
+                    )
+                    .await
+                    {
+                        Ok(found) => {
+                            db::cache_discoveries(
+                                &*state.connection()?,
+                                &cache_key,
+                                "wikidata",
+                                &found,
+                            )?;
+                            Ok(found)
+                        }
+                        Err(error) => {
+                            record_rate_limit_backoff(state, "wikidata", &error)?;
+                            Err(error)
                         }
                     }
                 }
@@ -1089,8 +1229,8 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         }
     }
     results.sort_by(|left, right| {
-        discovery_priority(right)
-            .cmp(&discovery_priority(left))
+        discovery_priority(right, &brief)
+            .cmp(&discovery_priority(left, &brief))
             .then_with(|| left.company_name.cmp(&right.company_name))
     });
     let mut seen = std::collections::HashSet::new();
@@ -1162,14 +1302,18 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
 
     // Research a broad pre-ranked pool in bounded batches. The requested count
     // is the maximum number of strong matches, never a pre-research truncation.
-    const PARALLEL_RESEARCH: usize = 6;
-    const SEARCH_BUDGET_SECONDS: u64 = 45;
+    // These are all distinct hosts; per-site politeness comes from the delay
+    // inside crawl_account_with_page_budget, not from this width.
+    const PARALLEL_RESEARCH: usize = 12;
+    let budget = search_budget(brief.result_limit);
     let started = std::time::Instant::now();
     let mut completed = 0_i64;
+    let mut stopped_by_budget = false;
     let batch_size = brief.result_limit.max(1) as usize;
     let mut confirmation_due = false;
     for batch in candidate_ids.chunks(batch_size) {
-        if started.elapsed() >= Duration::from_secs(SEARCH_BUDGET_SECONDS) {
+        if started.elapsed() >= budget {
+            stopped_by_budget = true;
             break;
         }
         let mut pending = batch.iter().cloned();
@@ -1242,7 +1386,8 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
                 40 + (completed * 55 / total.max(1)),
                 &format!("Researched {completed} of {total} discovered candidates"),
             )?;
-            if started.elapsed() >= Duration::from_secs(SEARCH_BUDGET_SECONDS) {
+            if started.elapsed() >= budget {
+                stopped_by_budget = true;
                 tasks.abort_all();
                 break;
             }
@@ -1258,7 +1403,8 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
             break;
         }
         confirmation_due = strong >= brief.result_limit;
-        if started.elapsed() >= Duration::from_secs(SEARCH_BUDGET_SECONDS) {
+        if started.elapsed() >= budget {
+            stopped_by_budget = true;
             break;
         }
     }
@@ -1274,21 +1420,43 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         brief.quality_band,
         brief.result_limit,
     )?;
+    // A run stopped by its time budget left candidates unresearched. Recording
+    // that keeps "we ran out of time" distinct from "these did not qualify" —
+    // without it the UI blamed the score band for an unfinished search.
+    let unresearched = (total - completed).max(0);
+    if stopped_by_budget && unresearched > 0 {
+        db::add_search_warning(
+            &*state.connection()?,
+            run_id,
+            SourceWarning {
+                source: "Search time budget".into(),
+                message: format!(
+                    "The search reached its {}-second budget with {unresearched} of {total} discovered candidates still unresearched. Those candidates were not rejected; they were never checked. Run the search again to continue, or request fewer results.",
+                    budget.as_secs()
+                ),
+                used_cached_results: false,
+                cache_age_hours: None,
+            },
+        )?;
+    }
     db::finish_search_run(&*state.connection()?, run_id, "complete", None)?;
-    let _ = app.emit(
-        "search-run-progress",
-        db::get_search_run(&*state.connection()?, run_id)?,
-    );
+    publish_search_finished(state, app, run_id)?;
     Ok(())
 }
 
-fn discovery_priority(result: &DiscoveryResult) -> i64 {
+/// Rank a discovered record before research.
+///
+/// This decides which candidates survive truncation to the candidate budget, so
+/// relevance to the approved brief leads and metadata completeness breaks ties.
+/// Ordering on completeness alone kept the best-documented records rather than
+/// the ones most likely to fit.
+fn discovery_priority(result: &DiscoveryResult, brief: &SearchBrief) -> i64 {
     let identity = match result.identity_confidence.as_deref() {
         Some("high") => 20,
         Some("medium") => 12,
         _ => 0,
     };
-    identity
+    let completeness = identity
         + if result.website_url.is_some() { 45 } else { 0 }
         + if result.domain.is_some() { 20 } else { 0 }
         + if result.business_phone.is_some() {
@@ -1296,7 +1464,68 @@ fn discovery_priority(result: &DiscoveryResult) -> i64 {
         } else {
             0
         }
-        + if result.location.is_some() { 5 } else { 0 }
+        + if result.location.is_some() { 5 } else { 0 };
+    relevance_score(result, brief) * 4 + completeness
+}
+
+/// Whole-word overlap between a discovered record and the approved brief.
+fn relevance_score(result: &DiscoveryResult, brief: &SearchBrief) -> i64 {
+    let haystack = normalized_tokens(&format!("{} {}", result.company_name, result.reason));
+    let padded = format!(" {haystack} ");
+    let mut score = 0;
+    for segment in &brief.segments {
+        if term_hit(&padded, &segment.label) {
+            score += 12;
+        }
+        if let Some(category) = &segment.discovery_category {
+            if term_hit(&padded, &category.replace('_', " ")) {
+                score += 8;
+            }
+        }
+    }
+    for rule in &brief.positive_signals {
+        if rule
+            .keywords
+            .iter()
+            .any(|keyword| term_hit(&padded, keyword))
+        {
+            score += 5;
+        }
+    }
+    score.min(60)
+}
+
+fn normalized_tokens(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// True when any word of `term` (of real length) appears in the padded haystack.
+fn term_hit(padded_haystack: &str, term: &str) -> bool {
+    normalized_tokens(term)
+        .split(' ')
+        .filter(|word| word.len() >= 4)
+        .any(|word| padded_haystack.contains(&format!(" {word} ")))
+}
+
+/// Wall-clock budget for researching a run's candidate pool.
+///
+/// The old fixed 45 seconds could not research the pool a 25- or 50-result
+/// request implies, so large requests silently returned a thin slice.
+fn search_budget(result_limit: i64) -> Duration {
+    Duration::from_secs((45 + result_limit.max(0) * 3).clamp(45, 240) as u64)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1377,7 +1606,6 @@ pub fn run() {
             apply_library_action,
             permanently_delete_accounts,
             research_account,
-            generate_prospect_package,
             get_draft_readiness,
             start_draft_generation,
             set_outcome,
@@ -1399,7 +1627,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod command_policy_tests {
-    use super::draft_status_allowed;
+    use super::*;
 
     #[test]
     fn unqualified_drafts_require_an_explicit_override() {
@@ -1407,5 +1635,112 @@ mod command_policy_tests {
         assert!(!draft_status_allowed("needs_review", false));
         assert!(!draft_status_allowed("researched", false));
         assert!(draft_status_allowed("needs_review", true));
+    }
+
+    #[test]
+    fn research_budget_scales_with_the_requested_result_count() {
+        // A fixed 45 seconds could not research the pool that a 25- or
+        // 50-result request implies, so large requests silently returned a
+        // thin slice and blamed the score band for it.
+        assert_eq!(search_budget(10).as_secs(), 75);
+        assert_eq!(search_budget(25).as_secs(), 120);
+        assert_eq!(search_budget(50).as_secs(), 195);
+        // Bounded at both ends so a hand-edited brief cannot stall a search.
+        assert_eq!(search_budget(0).as_secs(), 45);
+        assert_eq!(search_budget(-5).as_secs(), 45);
+        assert_eq!(search_budget(10_000).as_secs(), 240);
+    }
+
+    fn discovery(name: &str, reason: &str, website: bool) -> DiscoveryResult {
+        DiscoveryResult {
+            source: "OpenStreetMap".into(),
+            company_name: name.into(),
+            domain: website.then(|| "example.com".into()),
+            website_url: website.then(|| "https://example.com".into()),
+            external_id: None,
+            reason: reason.into(),
+            source_url: "https://www.openstreetmap.org/node/1".into(),
+            source_external_id: None,
+            business_phone: None,
+            location: Some("Ohio, United States".into()),
+            identity_confidence: Some("medium".into()),
+        }
+    }
+
+    fn brief_for(segment: &str, label: &str) -> SearchBrief {
+        SearchBrief {
+            id: "b".into(),
+            query: "q".into(),
+            product_summary: "p".into(),
+            customer_outcome: "o".into(),
+            segments: vec![TargetSegment {
+                id: segment.into(),
+                label: label.into(),
+                discovery_category: Some(segment.into()),
+            }],
+            geography: "Ohio".into(),
+            company_sizes: vec![],
+            target_personas: vec![],
+            positive_signals: vec![QualificationRule {
+                id: "after_hours".into(),
+                label: "After-hours service".into(),
+                component: "signal".into(),
+                keywords: vec!["emergency service".into()],
+                points: 55,
+                hard_gate: false,
+            }],
+            exclusions: vec![],
+            discovery_lanes: vec![],
+            result_limit: 10,
+            qualification_threshold: 70,
+            quality_band: 12,
+            approved: true,
+            assumptions: vec![],
+            interpreter: "manual_rules".into(),
+            model_tag: None,
+            model_digest: None,
+            prompt_version: SEARCH_PROMPT_VERSION.into(),
+            created_at: "now".into(),
+        }
+    }
+
+    #[test]
+    fn pre_ranking_prefers_relevance_over_metadata_completeness() {
+        let brief = brief_for("plumber", "Plumbing services");
+        // Ranking on completeness alone kept the best-documented record even
+        // when it had nothing to do with the brief.
+        let relevant_sparse = discovery(
+            "Reliable Plumbing",
+            "Mapped plumber in the bounded Ohio sample.",
+            false,
+        );
+        let irrelevant_complete = discovery(
+            "Bloom Florist",
+            "Mapped florist in the bounded Ohio sample.",
+            true,
+        );
+        assert!(
+            discovery_priority(&relevant_sparse, &brief)
+                > discovery_priority(&irrelevant_complete, &brief),
+            "a relevant candidate must outrank a merely well-documented one"
+        );
+    }
+
+    #[test]
+    fn completeness_still_breaks_ties_between_equally_relevant_records() {
+        let brief = brief_for("plumber", "Plumbing services");
+        let reason = "Mapped plumber in the bounded Ohio sample.";
+        assert!(
+            discovery_priority(&discovery("A Plumbing", reason, true), &brief)
+                > discovery_priority(&discovery("B Plumbing", reason, false), &brief)
+        );
+    }
+
+    #[test]
+    fn relevance_scoring_ignores_short_noise_words() {
+        let brief = brief_for("plumber", "Plumbing services");
+        // "in", "the" and similar must never earn relevance points.
+        let noise = discovery("Generic Co", "in the of and", false);
+        assert_eq!(relevance_score(&noise, &brief), 0);
     }
 }

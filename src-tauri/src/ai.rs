@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::catalog;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::*;
@@ -282,14 +283,18 @@ pub async fn propose_sales_play(
     Ok(current)
 }
 
+/// Compile an approved-pending search brief from the curated catalog.
+///
+/// Deterministic and offline by design: search planning must feel instant, and
+/// the local 9B model stays available for drafting rather than blocking the
+/// first click. It never contacted Ollama, so it no longer takes a client.
 pub async fn interpret_search_brief(
-    _client: &Client,
     query: &str,
     product_reference: Option<&str>,
     geography: &str,
     result_limit: i64,
     play: Option<&SalesPlay>,
-) -> AppResult<(SearchBrief, Option<String>)> {
+) -> AppResult<SearchBrief> {
     let query = query.trim();
     if query.len() < 12 {
         return Err(AppError::Message(
@@ -336,6 +341,24 @@ pub async fn interpret_search_brief(
     if lower.contains("government") || lower.contains("federal") || lower.contains("contractor") {
         lanes.push(DiscoveryLane { id:"award-recipients".into(),label:"Federal award recipients".into(),mode:"guided".into(),source:"usaspending".into(),reason:"USAspending can resolve recipient names but is not a general contractor-category directory.".into(),limitation:"Recipient lookup by name only; identity may require review.".into() });
     }
+    // Open reference data covers organizations that have no mapped premise —
+    // agencies, studios, publishers, firms without a storefront — so a query
+    // that matches no curated map category still has an automatic route.
+    // Resolution happens at search time; planning stays offline and instant.
+    if !reference_terms(query).is_empty() {
+        lanes.push(DiscoveryLane {
+            id: "reference-data".into(),
+            label: "Open reference data".into(),
+            mode: "automatic".into(),
+            source: "wikidata".into(),
+            reason:
+                "Your description is resolved to an organization type in Wikidata, then U.S. organizations of that type with published websites are collected."
+                    .into(),
+            limitation:
+                "Covers organizations recorded as notable in open reference data, not every business that exists."
+                    .into(),
+        });
+    }
     lanes.push(DiscoveryLane {
         id: "guided-web".into(),
         label: "General private businesses".into(),
@@ -345,59 +368,63 @@ pub async fn interpret_search_brief(
         limitation: "The user selects results; search-result pages are never scraped.".into(),
     });
     let mut assumptions = proposal.assumptions;
-    if geography.eq_ignore_ascii_case("United States") {
+    if !segments
+        .iter()
+        .any(|segment| segment.discovery_category.is_some())
+    {
+        // Say plainly that nothing matched, rather than leaving the user to
+        // guess whether they phrased the request wrong.
         assumptions.push(
-            "Broad United States discovery uses bounded regional samples and is not exhaustive."
+            "No mapped business category matched your description, so the map source is not used. Open reference data covers organizations without a storefront and is used instead."
                 .into(),
         );
     }
-    assumptions.push(
-        "An instant deterministic compiler produced this editable plan; no model inference or network request was required."
-            .into(),
-    );
+    if geography.eq_ignore_ascii_case("United States") {
+        assumptions.push(
+            "A nationwide search samples major metro areas, not every town. Naming a state or city gives fuller coverage there."
+                .into(),
+        );
+    }
     if product_reference.is_some() {
         assumptions.push(
-            "The optional product website was not fetched during instant search planning.".into(),
+            "Your product website is saved with this plan but is not read while planning.".into(),
         );
     }
     assumptions.sort();
     assumptions.dedup();
-    Ok((
-        SearchBrief {
-            id: Uuid::new_v4().to_string(),
-            query: query.into(),
-            product_summary: proposal.product_summary.trim().chars().take(500).collect(),
-            customer_outcome: proposal.customer_outcome.trim().chars().take(500).collect(),
-            segments,
-            geography,
-            company_sizes: Vec::new(),
-            target_personas: proposal
-                .target_personas
-                .into_iter()
-                .filter(|value| !value.trim().is_empty())
-                .take(6)
-                .collect(),
-            positive_signals: signals,
-            exclusions: proposal
-                .exclusions
-                .into_iter()
-                .filter(|value| !value.trim().is_empty())
-                .take(8)
-                .collect(),
-            discovery_lanes: lanes,
-            result_limit: result_limit.clamp(1, 50),
-            qualification_threshold: 70,
-            quality_band: 4,
-            approved: false,
-            assumptions,
-            interpreter: "manual_rules".into(),
-            model_tag: None,
-            model_digest: None,
-            prompt_version: SEARCH_PROMPT_VERSION.into(),
-            created_at: db::now(),
-        },
-        None,
-    ))
+    Ok(SearchBrief {
+        id: Uuid::new_v4().to_string(),
+        query: query.into(),
+        product_summary: proposal.product_summary.trim().chars().take(500).collect(),
+        customer_outcome: proposal.customer_outcome.trim().chars().take(500).collect(),
+        segments,
+        geography,
+        company_sizes: Vec::new(),
+        target_personas: proposal
+            .target_personas
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .take(6)
+            .collect(),
+        positive_signals: signals,
+        exclusions: proposal
+            .exclusions
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .take(8)
+            .collect(),
+        discovery_lanes: lanes,
+        result_limit: result_limit.clamp(1, 50),
+        qualification_threshold: 70,
+        quality_band: 4,
+        approved: false,
+        assumptions,
+        interpreter: "manual_rules".into(),
+        model_tag: None,
+        model_digest: None,
+        prompt_version: SEARCH_PROMPT_VERSION.into(),
+        created_at: db::now(),
+    })
 }
 
 fn manual_search_proposal(query: &str, play: Option<&SalesPlay>) -> SearchBriefProposal {
@@ -405,39 +432,48 @@ fn manual_search_proposal(query: &str, play: Option<&SalesPlay>) -> SearchBriefP
     let voice_related = ["voice", "phone", "call", "intake", "answering"]
         .iter()
         .any(|value| lower.contains(value));
-    let explicit_segment_ids = [
-        ("plumb", "plumber"),
-        ("electric", "electrician"),
-        ("hvac", "hvac"),
-        ("roof", "roofer"),
-        ("law", "lawyer"),
-        ("property manag", "property_management"),
-        ("auto", "car_repair"),
-        ("car repair", "car_repair"),
-        ("restaurant", "restaurant"),
-        ("hotel", "hotel"),
-    ]
-    .into_iter()
-    .filter_map(|(keyword, id)| lower.contains(keyword).then_some(id))
-    .collect::<Vec<_>>();
-    let segment_ids = if !explicit_segment_ids.is_empty() {
-        explicit_segment_ids
+    // Whole-word matching against the curated catalog. The previous substring
+    // table had nine entries and misfired on words that merely contained them.
+    let matched = catalog::match_query(query);
+    let segment_ids = if !matched.is_empty() {
+        matched
+            .iter()
+            .map(|category| category.id)
+            .collect::<Vec<_>>()
     } else if voice_related {
-        vec!["plumber", "hvac", "lawyer"]
+        // A phone-workflow product with no named vertical: fall back to the
+        // call-heavy service trades rather than giving up on automatic lanes.
+        vec!["plumber", "hvac", "electrician", "car_repair"]
     } else {
-        vec!["general_business"]
+        vec![catalog::GENERAL_BUSINESS]
     };
-    let signal_ids = if voice_related {
-        vec![
+    // Signals suited to the matched verticals, plus the phone-workflow set when
+    // the query is about calls. Ordered and deduplicated for a stable brief.
+    let mut signal_ids = Vec::new();
+    for category in &matched {
+        for signal in category.signals {
+            if !signal_ids.contains(signal) {
+                signal_ids.push(*signal);
+            }
+        }
+    }
+    if voice_related {
+        for signal in [
             "after_hours",
             "call_first",
             "appointment",
             "intake_hiring",
             "multiple_locations",
-        ]
-    } else {
-        vec!["hiring", "expansion", "recent_launch"]
-    };
+        ] {
+            if !signal_ids.contains(&signal) {
+                signal_ids.push(signal);
+            }
+        }
+    }
+    if signal_ids.is_empty() {
+        signal_ids = vec!["hiring", "expansion", "recent_launch"];
+    }
+    signal_ids.truncate(6);
     SearchBriefProposal {
         product_summary: play
             .map(|value| value.offer.clone())
@@ -466,38 +502,214 @@ fn manual_search_proposal(query: &str, play: Option<&SalesPlay>) -> SearchBriefP
         .collect(),
         signal_ids: signal_ids.into_iter().map(str::to_string).collect(),
         exclusions: if voice_related {
-            vec!["public safety", "emergency response agency", "healthcare"]
+            auto_exclusions(&matched)
         } else {
             Vec::new()
-        }
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
+        },
         assumptions: vec![
-            "Proposed segments are hypotheses until public evidence supports account-level fit."
+            "The business types below were inferred from your description. Edit them if they are wrong — nothing is searched until you approve this plan."
                 .into(),
         ],
     }
 }
 
+/// Exclusions the phone-workflow brief proposes on its own, each paired with
+/// the catalog sector it would contradict.
+///
+/// Exclusions are a hard gate: a match forces the score to zero and the state
+/// to `rejected`. Proposing "healthcare" unconditionally therefore rejected
+/// every dentist and medical practice the user had *explicitly* asked for, as
+/// soon as their own website mentioned the word. An auto-proposed exclusion is
+/// only ever a guess about what the user did not mean, so it must yield to an
+/// explicit selection. Exclusions the user types are never touched.
+fn auto_exclusions(matched: &[&'static catalog::Category]) -> Vec<String> {
+    const PROPOSED: &[(&str, &str)] = &[
+        ("public safety", "public_safety"),
+        ("emergency response agency", "public_safety"),
+        ("healthcare", "healthcare"),
+    ];
+    PROPOSED
+        .iter()
+        .filter(|(_, conflicting_sector)| {
+            !matched
+                .iter()
+                .any(|category| category.sector == *conflicting_sector)
+        })
+        .map(|(term, _)| (*term).to_string())
+        .collect()
+}
+
+/// Words worth resolving against open reference data.
+///
+/// Filler is stripped so the phrase sent to the entity lookup describes the
+/// audience ("talent agency", "literary management") rather than the whole
+/// sentence. Kept public so the run executor resolves the same terms the plan
+/// promised.
+pub fn reference_terms(query: &str) -> String {
+    const FILLER: &[&str] = &[
+        "have",
+        "has",
+        "had",
+        "looking",
+        "look",
+        "want",
+        "wanted",
+        "need",
+        "needs",
+        "needed",
+        "get",
+        "getting",
+        "find",
+        "finding",
+        "seeking",
+        "seek",
+        "trying",
+        "try",
+        "with",
+        "from",
+        "that",
+        "this",
+        "these",
+        "those",
+        "they",
+        "them",
+        "their",
+        "there",
+        "here",
+        "and",
+        "the",
+        "for",
+        "our",
+        "out",
+        "who",
+        "how",
+        "what",
+        "when",
+        "where",
+        "which",
+        "would",
+        "should",
+        "could",
+        "about",
+        "into",
+        "over",
+        "some",
+        "any",
+        "all",
+        "was",
+        "were",
+        "are",
+        "you",
+        "your",
+        "sell",
+        "sells",
+        "selling",
+        "offer",
+        "offering",
+        "help",
+        "helping",
+        "make",
+        "making",
+        "business",
+        "businesses",
+        "company",
+        "companies",
+        "customer",
+        "customers",
+        "client",
+        "clients",
+        "people",
+        "someone",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    query
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| word.len() > 2 && !FILLER.contains(word))
+        .filter(|word| seen.insert(word.to_string()))
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudienceTypes {
+    organization_types: Vec<String>,
+}
+
+/// Ask the local model what *kind of organization* serves the described need.
+///
+/// A description names a need, not a directory heading: "I have a pilot script
+/// and want representation" is served by talent and literary agencies, but
+/// contains neither phrase. Deterministic keywords cannot bridge that, which is
+/// why an open-ended query found nothing.
+///
+/// **This does not weaken the source-query rule.** The model returns short
+/// common nouns in plain English. Each is looked up through Wikidata's own
+/// entity search, and only a validated `Q…` id ever reaches the fixed SPARQL
+/// template. The model cannot emit query syntax, and anything it invents that
+/// is not a real Wikidata class simply resolves to nothing.
+pub async fn propose_audience_types(client: &Client, query: &str) -> AppResult<Vec<String>> {
+    let health = ollama_health(client).await;
+    if !health.reachable || !health.model_installed {
+        return Ok(Vec::new());
+    }
+    let messages = vec![
+        json!({"role":"system","content":"Name the kinds of ORGANIZATION that serve or transact with the described need. Use short, common, encyclopedic nouns for types of company or organization, exactly as an encyclopedia would title them: \"talent agency\", \"literary agency\", \"record label\", \"advertising agency\", \"law firm\". Never name a specific company, a person, a job title, or a product. Never output punctuation, code, or query syntax. Two to five entries, most likely first."}),
+        json!({"role":"user","content": format!("<untrusted_user_description>\n{}\n</untrusted_user_description>", query.chars().take(2_000).collect::<String>())}),
+    ];
+    let schema = json!({
+        "type":"object",
+        "properties":{"organizationTypes":{"type":"array","items":{"type":"string","minLength":3,"maxLength":60},"minItems":1,"maxItems":5}},
+        "required":["organizationTypes"],
+        "additionalProperties":false
+    });
+    let value = ollama_chat(client, messages, schema).await?;
+    let proposal: AudienceTypes = serde_json::from_value(value)?;
+    Ok(sanitize_audience_types(proposal.organization_types))
+}
+
+/// Keep only plain multi-word-or-single-word nouns. Anything carrying syntax,
+/// digits, or excess length is discarded rather than looked up.
+fn sanitize_audience_types(types: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    types
+        .into_iter()
+        .map(|value| {
+            value
+                .to_ascii_lowercase()
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric() || *character == ' ')
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|value| {
+            (3..=60).contains(&value.len())
+                && value.split_whitespace().count() <= 4
+                && !value.chars().any(|character| character.is_ascii_digit())
+        })
+        .filter(|value| seen.insert(value.clone()))
+        .take(5)
+        .collect()
+}
+
 fn segment_template(id: &str) -> Option<TargetSegment> {
-    let label = match id {
-        "plumber" => "Plumbing services",
-        "electrician" => "Electrical services",
-        "hvac" => "HVAC services",
-        "roofer" => "Roofing services",
-        "lawyer" => "Law firms",
-        "property_management" => "Property management",
-        "car_repair" => "Auto service and repair",
-        "restaurant" => "Restaurants",
-        "hotel" => "Hotels",
-        "general_business" => "General private businesses",
-        _ => return None,
-    };
+    if id == catalog::GENERAL_BUSINESS {
+        return Some(TargetSegment {
+            id: id.into(),
+            label: catalog::GENERAL_BUSINESS_LABEL.into(),
+            // No discovery category, so the brief gets no automatic lane.
+            discovery_category: None,
+        });
+    }
+    let category = catalog::find(id)?;
     Some(TargetSegment {
-        id: id.into(),
-        label: label.into(),
-        discovery_category: (!matches!(id, "general_business")).then(|| id.into()),
+        id: category.id.into(),
+        label: category.label.into(),
+        discovery_category: Some(category.id.into()),
     })
 }
 
@@ -610,6 +822,8 @@ fn parse_structured_content(content: &str) -> AppResult<Value> {
         .map_err(|error| AppError::Message(format!("Ollama returned malformed JSON: {error}")))
 }
 
+/// Test-only convenience wrapper over `generate_with_progress`.
+#[cfg(test)]
 pub async fn generate(
     client: &Client,
     package: &ProspectPackage,
@@ -977,14 +1191,140 @@ mod tests {
         assert!(proposal.segment_ids.contains(&"plumber".into()));
         assert!(proposal.signal_ids.contains(&"after_hours".into()));
         assert!(proposal.signal_ids.contains(&"intake_hiring".into()));
-        assert!(proposal.segment_ids.len() <= 3);
+        assert!(proposal.segment_ids.len() <= catalog::MAX_MATCHED_CATEGORIES);
         assert!(!proposal.segment_ids.iter().any(|value| value.contains('[')));
+        // Every compiled segment must resolve to a curated catalog entry, so
+        // nothing can reach Overpass as improvised tag syntax.
+        assert!(proposal
+            .segment_ids
+            .iter()
+            .all(|id| catalog::find(id).is_some() || id == catalog::GENERAL_BUSINESS));
 
         let explicit = manual_search_proposal(
             "I sell voice intake specifically to plumbing companies",
             None,
         );
         assert_eq!(explicit.segment_ids, vec!["plumber"]);
+    }
+
+    #[test]
+    fn explicitly_targeting_a_sector_drops_its_auto_exclusion() {
+        // Exclusions are a hard gate that forces score 0 and state "rejected",
+        // so an unconditional "healthcare" exclusion rejected the very dentists
+        // the user asked for as soon as their site used the word.
+        let dental = manual_search_proposal("voice intake for dental practices", None);
+        assert!(dental.segment_ids.contains(&"dentist".into()));
+        assert!(
+            !dental.exclusions.iter().any(|item| item == "healthcare"),
+            "an explicitly targeted sector must not be excluded: {:?}",
+            dental.exclusions
+        );
+        // The unrelated guesses survive.
+        assert!(dental.exclusions.iter().any(|item| item == "public safety"));
+
+        for query in [
+            "voice intake for medical practices",
+            "phone answering for veterinary clinics",
+            "call handling for physical therapy clinics",
+        ] {
+            let proposal = manual_search_proposal(query, None);
+            assert!(
+                !proposal.exclusions.iter().any(|item| item == "healthcare"),
+                "{query} should not exclude healthcare"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_verticals_keep_the_healthcare_exclusion() {
+        let plumbing = manual_search_proposal("voice intake for plumbing companies", None);
+        assert!(plumbing.exclusions.iter().any(|item| item == "healthcare"));
+        assert!(plumbing
+            .exclusions
+            .iter()
+            .any(|item| item == "emergency response agency"));
+
+        // The generic phone-workflow fallback keeps every guess too.
+        let generic = manual_search_proposal(
+            "I sell a voice intake system for businesses with inbound calls",
+            None,
+        );
+        assert_eq!(generic.exclusions.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn any_legitimate_audience_gets_an_automatic_lane() {
+        // Reported failure: this returned a guided-only brief and a dead end,
+        // because OpenStreetMap only maps businesses with a physical premise.
+        // Open reference data covers organizations regardless of premise.
+        for query in [
+            "Have a script for a pilot. Looking to get representation and management",
+            "I need a literary agent for my novel",
+            "Looking for record labels that sign indie artists",
+            "Find architecture firms that specialise in adaptive reuse",
+            "I sell voice intake to plumbing companies",
+            "Looking for venture capital firms investing in climate tech",
+        ] {
+            let brief = interpret_search_brief(query, None, "United States", 10, None)
+                .await
+                .expect("a legitimate description must compile to a brief");
+            assert!(
+                brief
+                    .discovery_lanes
+                    .iter()
+                    .any(|lane| lane.mode == "automatic"),
+                "{query} must have an automatic discovery lane"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_terms_describe_the_audience_not_the_sentence() {
+        assert_eq!(
+            reference_terms(
+                "Have a script for a pilot. Looking to get representation and management"
+            ),
+            "script pilot representation management"
+        );
+        assert_eq!(
+            reference_terms("I need a literary agent for my novel"),
+            "literary agent novel"
+        );
+        // Filler alone leaves nothing worth resolving, so no lane is promised.
+        assert_eq!(reference_terms("looking for the business"), "");
+        assert_eq!(reference_terms(""), "");
+    }
+
+    #[test]
+    fn proposed_audience_types_are_plain_nouns_only() {
+        // The model bridges "I want representation" to "talent agency". It may
+        // only ever produce plain nouns: anything carrying syntax, digits, or a
+        // sentence is discarded before it reaches an entity lookup.
+        let cleaned = sanitize_audience_types(vec![
+            "Talent Agency".into(),
+            "literary agency".into(),
+            "talent agency".into(),
+            "wd:Q5354754".into(),
+            "SELECT ?x WHERE { ?x a ?y }".into(),
+            "agency123".into(),
+            "a".into(),
+            "an organization that represents writers and helps them find work".into(),
+        ]);
+        assert_eq!(cleaned, vec!["talent agency", "literary agency"]);
+        for value in &cleaned {
+            assert!(value.chars().all(|c| c.is_ascii_lowercase() || c == ' '));
+        }
+    }
+
+    #[test]
+    fn every_catalog_entry_declares_a_sector() {
+        for category in catalog::CATEGORIES {
+            assert!(
+                !category.sector.is_empty(),
+                "{} must declare a sector",
+                category.id
+            );
+        }
     }
 
     #[test]

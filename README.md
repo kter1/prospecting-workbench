@@ -8,7 +8,7 @@ It does **not** send email, place calls, guess addresses, scrape LinkedIn or sea
 
 - Prompt-first discovery with an editable, versioned search brief and explicit automatic/guided coverage labels.
 - A stable offer profile separated from immutable per-query search runs.
-- Bounded OpenStreetMap Overpass discovery for curated local-business categories, with attribution and no model-generated source queries.
+- Bounded OpenStreetMap Overpass discovery across a curated catalog of roughly 90 U.S. business verticals and every U.S. state plus about 50 metro areas, with attribution and no model-generated source queries. Requests rotate across mirrors and across bounded regions, so repeating a search samples new ground.
 - Progressive, cancellable, resumable search runs with run-keyed progress, overlap prevention, recovery after restart, and independent per-query assessments.
 - Quality-first retrieval that discovers a broader pool before research, returns up to the requested number of strong matches, enforces the visible threshold and four-point primary score band, and separates near matches from excluded diagnostics.
 - A 24-hour normalized Overpass cache, persistent source backoff, cached-result age warnings, partial-source success, and deterministic pre-ranking before batched research.
@@ -18,12 +18,12 @@ It does **not** send email, place calls, guess addresses, scrape LinkedIn or sea
 - Company-site research across permitted public company, contact, leadership, careers, news, feed, Greenhouse, and Lever pages.
 - Supplemental GDELT news and exact-identity GitHub organization signals.
 - Robots handling, redirect revalidation, private-address and unsafe-scheme blocking, response/type limits, and `Retry-After` errors.
-- SQLite/FTS5 evidence ledger, serialized writes, resumable local jobs, content hashes, HTTP cache metadata, freshness labels, suppression, and manual outcomes.
+- SQLite evidence ledger, serialized writes, resumable local jobs, content hashes, HTTP cache metadata, derived freshness labels, suppression, and manual outcomes.
 - Saved, Favorites, All Discovered, and Trash library views with independent selection controls, transactional bulk actions, eight-second trash undo, and confirmed trash-only permanent deletion.
-- Fixed 35/30/20/15 scoring in application code. Local AI proposes constrained search rules and cited writing artifacts, never numeric scores.
+- Fixed 35/30/20/15 scoring in application code. Search planning is always a deterministic local compiler that selects from the curated catalog and never contacts a model. Local AI proposes the offer profile and writes cited artifacts, never numeric scores or source queries.
 - Multiple focused evidence excerpts per page for workflow, hiring, location, identity, and contact facts; raw HTML is discarded.
 - Pinned local `qwen3.5:9b` generation through Ollama JSON-schema output, readiness checks, persisted milestone progress, idempotent artifact saving, and a separate citation verification pass.
-- Deterministic fake provider and recorded/unit fixtures for tests. The fake-provider button only appears in development builds.
+- Deterministic fake provider, plus fixture tests covering every public-source parser against well-formed, malformed, duplicated, and injection-bearing payloads. The fake-provider button only appears in development builds.
 - Version 3 local JSON export with v1/v2 import compatibility, full deletion, source health, model health, saved-account-only daily scans while the app is open, and missed-scan catch-up at launch.
 
 ## Requirements
@@ -58,7 +58,7 @@ The application creates its SQLite database in the operating system’s applicat
 6. Add sender identity, postal address, and opt-out language before generating a ready-to-use commercial draft.
 7. Review the verified package, record an outcome, or suppress the account.
 
-If Ollama is unavailable, query interpretation falls back to a clearly labeled, editable local rule set. Seed import and stored records remain usable; there is never a hosted-model fallback.
+Query interpretation never needs Ollama: the search plan is compiled instantly and deterministically from the curated catalog, and every rule stays visible and editable before approval. Ollama is used for the optional offer-profile proposal and for drafting. Seed import and stored records remain usable; there is never a hosted-model fallback.
 
 The tool prepares material for human review only. It never sends or schedules outreach.
 
@@ -92,7 +92,9 @@ Live-adapter checks are intentionally not part of CI; source behavior and rate l
 - [Public Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/)
 - [Ollama structured outputs](https://docs.ollama.com/capabilities/structured-outputs)
 
-OpenStreetMap results are bounded samples and require attribution. The public Nominatim service is not used for systematic business enumeration. All coverage is bounded by public availability. “Not publicly found” is a valid result, not a prompt to infer or buy enrichment.
+OpenStreetMap results are bounded samples and require attribution. Geographies resolve against a static bounding-box table; the public Nominatim service is not used for systematic business enumeration. When a mapped business carries no address tags, its location is recorded as the bounded search area it was found in — a fact the query establishes — and labeled as such in its evidence. All coverage is bounded by public availability. “Not publicly found” is a valid result, not a prompt to infer or buy enrichment.
+
+A search that reaches its time budget reports how many discovered candidates went unresearched. Those candidates were not rejected, and the app says so rather than attributing the shortfall to its scoring band.
 
 ## Safety and compliance boundary
 

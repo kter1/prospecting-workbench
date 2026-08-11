@@ -92,15 +92,32 @@ pub fn validate_url(url: &Url) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_dns(url: &Url) -> AppResult<()> {
+/// Reject hosts that resolve to private or non-routable addresses.
+///
+/// `to_socket_addrs` is a blocking syscall, so it runs on the blocking pool
+/// rather than stalling a runtime worker while research tasks are in flight.
+///
+/// Note this check is advisory, not a hard SSRF guarantee: reqwest resolves the
+/// host again independently when it connects, so a hostile authoritative DNS
+/// server could return a public address here and a private one there. The
+/// scheme, port, and literal-IP checks in `validate_url` are the load-bearing
+/// controls; this one raises the cost of the DNS-rebinding case.
+async fn validate_dns(url: &Url) -> AppResult<()> {
     let host = url
         .host_str()
-        .ok_or_else(|| AppError::Message("Source URL has no host.".into()))?;
+        .ok_or_else(|| AppError::Message("Source URL has no host.".into()))?
+        .to_owned();
     let port = url.port_or_known_default().unwrap_or(443);
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .map_err(|_| AppError::Message(format!("Could not resolve {host}.")))?
-        .collect::<Vec<_>>();
+    let resolved = tokio::task::spawn_blocking(move || {
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect::<Vec<_>>())
+            .map_err(|_| host)
+    })
+    .await
+    .map_err(|_| AppError::Message("DNS resolution was interrupted.".into()))?;
+    let addresses =
+        resolved.map_err(|host| AppError::Message(format!("Could not resolve {host}.")))?;
     if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
         return Err(AppError::Message(
             "DNS resolved to a private or non-routable address.".into(),
@@ -113,7 +130,7 @@ pub async fn fetch_public(client: &Client, initial: Url) -> AppResult<FetchResul
     let mut current = initial;
     for _ in 0..=MAX_REDIRECTS {
         validate_url(&current)?;
-        validate_dns(&current)?;
+        validate_dns(&current).await?;
         let mut response = client.get(current.clone()).send().await?;
         if response.status().is_redirection() {
             let location = response
