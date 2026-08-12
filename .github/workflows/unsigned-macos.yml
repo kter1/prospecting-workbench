@@ -1,0 +1,35 @@
+name: unsigned macOS artifact
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm run generate:sbom
+      - run: pnpm tauri build
+      - name: Create checksums
+        run: find src-tauri/target/release/bundle -type f -print0 | xargs -0 shasum -a 256 > artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-macos
+          path: |
+            src-tauri/target/release/bundle/
+            artifacts/sbom.spdx.json
+            artifacts/SHA256SUMS
