@@ -74,5 +74,7 @@ export const api = {
   exportData: () => invoke<string>("export_data"),
   exportDiagnostics: () => invoke<string>("export_diagnostics"),
   importData: (payload: string) => invoke<void>("import_data", { payload }),
+  clearSearchHistory: () => invoke<void>("clear_search_history"),
+  clearProspects: () => invoke<void>("clear_prospects"),
   deleteAllData: () => invoke<void>("delete_all_data")
 };

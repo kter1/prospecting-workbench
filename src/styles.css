@@ -210,7 +210,9 @@ input:focus, textarea:focus, select:focus { border-color: #77a88b; box-shadow: 0
 .prompt-hero h2 { max-width: 760px; margin: 9px 0 8px; font-size: 27px; letter-spacing: -.04em; }
 .prompt-hero > p { max-width: 650px; margin: 0 0 20px; }
 .prompt-form > textarea { min-height: 126px; padding: 16px; border-color: #bdcfc2; background: rgba(255,255,255,.86); font-size: 15px; line-height: 1.55; box-shadow: 0 10px 30px rgba(31, 67, 45, .05); }
-.prompt-controls { display: grid; grid-template-columns: minmax(180px, 1.2fr) minmax(150px, .8fr) 145px auto; gap: 9px; margin-top: 10px; }
+.prompt-controls { display: grid; grid-template-columns: minmax(180px, 1.2fr) minmax(150px, .8fr) minmax(210px, auto) auto; gap: 9px; margin-top: 10px; }
+.prompt-controls > * { min-width: 0; }
+.prompt-controls select { width: 100%; text-overflow: ellipsis; }
 .search-receipt, .run-panel { padding: 27px; }
 .receipt-summary { max-width: 900px; margin: -5px 0 20px; color: #475049 !important; font-size: 14px !important; }
 .receipt-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }

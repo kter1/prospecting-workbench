@@ -517,6 +517,16 @@ fn import_data(state: State<'_, AppState>, payload: String) -> AppResult<()> {
 }
 
 #[tauri::command]
+fn clear_search_history(state: State<'_, AppState>) -> AppResult<()> {
+    db::clear_search_history(&*state.connection()?)
+}
+
+#[tauri::command]
+fn clear_prospects(state: State<'_, AppState>) -> AppResult<()> {
+    db::clear_prospects(&*state.connection()?)
+}
+
+#[tauri::command]
 fn delete_all_data(state: State<'_, AppState>) -> AppResult<()> {
     db::delete_all(&*state.connection()?)?;
     let exports = state.app_data_dir.join("exports");
@@ -1619,6 +1629,8 @@ pub fn run() {
             export_data,
             export_diagnostics,
             import_data,
+            clear_search_history,
+            clear_prospects,
             delete_all_data
         ])
         .run(tauri::generate_context!())

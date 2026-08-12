@@ -2358,6 +2358,46 @@ pub fn restore_json(connection: &mut Connection, payload: &str) -> AppResult<()>
     Ok(())
 }
 
+/// Remove every past search run, its candidate list, and its cached discoveries.
+///
+/// Accounts survive: a saved prospect is worth keeping even when the run that
+/// found it is not.
+pub fn clear_search_history(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        "DELETE FROM search_run_accounts;
+         DELETE FROM search_runs;
+         DELETE FROM search_briefs;
+         DELETE FROM discovery_cache;",
+    )?;
+    Ok(())
+}
+
+/// Remove every prospect and everything attached to it.
+///
+/// Search history goes too, because a run whose candidates no longer exist is
+/// an empty row that can only confuse. The offer profile, sales play, and
+/// settings are preserved — this clears work, not configuration.
+pub fn clear_prospects(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        "DELETE FROM search_run_accounts;
+         DELETE FROM search_runs;
+         DELETE FROM search_briefs;
+         DELETE FROM discovery_cache;
+         DELETE FROM source_identities;
+         DELETE FROM outcomes;
+         DELETE FROM suppressions;
+         DELETE FROM jobs;
+         DELETE FROM draft_artifacts;
+         DELETE FROM packages;
+         DELETE FROM contacts;
+         DELETE FROM signals;
+         DELETE FROM evidence;
+         DELETE FROM people;
+         DELETE FROM accounts;",
+    )?;
+    Ok(())
+}
+
 pub fn delete_all(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
         "DELETE FROM search_run_accounts; DELETE FROM search_runs; DELETE FROM search_briefs; DELETE FROM source_identities; DELETE FROM discovery_cache; DELETE FROM source_backoff; DELETE FROM offer_profile;
