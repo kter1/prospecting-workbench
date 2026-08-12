@@ -36,7 +36,7 @@ if [ -f live-search.png ]; then
   echo
   ls -lh ./*.png | awk '{print "  •", $9, $5}'
   echo
-  echo "  Tell Claude — it will check the frame before committing."
+  echo "  Review the frame, then commit it."
 else
   echo "  ✗ cancelled — re-run to retry"
 fi
