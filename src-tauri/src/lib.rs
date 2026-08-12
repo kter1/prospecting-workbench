@@ -44,7 +44,7 @@ fn bootstrap_app(state: State<'_, AppState>) -> AppResult<DashboardSnapshot> {
     // Freshness is a pure function of `retrieved_at`, so it is derived in the
     // read query rather than persisted. This used to rewrite the entire
     // evidence table and then recompute quality flags for every account on
-    // every bootstrap — and the frontend bootstraps on mount, after each search
+    // every bootstrap, and the frontend bootstraps on mount, after each search
     // run, after each draft, after imports and deletes, and hourly. Flags are
     // recomputed on the write path, where evidence actually changes.
     db::recover_interrupted_jobs(&connection)?;
@@ -863,7 +863,7 @@ async fn process_search_candidate(
 ///
 /// Deliberately carries counters only. This fires once per researched
 /// candidate, so reading the full run here made the cost of each tick grow
-/// with the pool already researched — quadratic overall, and megabytes of IPC
+/// with the pool already researched, quadratic overall, and megabytes of IPC
 /// per tick at high candidate targets. The UI pages accounts in separately.
 fn publish_search_progress(
     state: &AppState,
@@ -1431,7 +1431,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         brief.result_limit,
     )?;
     // A run stopped by its time budget left candidates unresearched. Recording
-    // that keeps "we ran out of time" distinct from "these did not qualify" —
+    // that keeps "we ran out of time" distinct from "these did not qualify",
     // without it the UI blamed the score band for an unfinished search.
     let unresearched = (total - completed).max(0);
     if stopped_by_budget && unresearched > 0 {

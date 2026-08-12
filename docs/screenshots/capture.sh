@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 
 cat <<'INTRO'
 ══════════════════════════════════════════════════════════
-  live-search.png — a search in progress
+  live-search.png, a search in progress
 ══════════════════════════════════════════════════════════
   1. Discover tab. Type anything real, for example:
 
@@ -38,5 +38,5 @@ if [ -f live-search.png ]; then
   echo
   echo "  Review the frame, then commit it."
 else
-  echo "  ✗ cancelled — re-run to retry"
+  echo "  ✗ cancelled, re-run to retry"
 fi

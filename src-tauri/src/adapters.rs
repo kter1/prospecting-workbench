@@ -528,7 +528,7 @@ fn parse_overpass_elements(
 /// Deduplicate by domain, then by name+location.
 ///
 /// The previous implementation sorted by name and called `dedup_by`, which only
-/// removes *adjacent* duplicates — same-domain records under different names
+/// removes *adjacent* duplicates, same-domain records under different names
 /// survived.
 fn dedupe_discoveries(results: Vec<DiscoveryResult>, limit: usize) -> Vec<DiscoveryResult> {
     let mut seen = std::collections::HashSet::new();

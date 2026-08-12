@@ -1,82 +1,78 @@
 # Prospecting Workbench
 
-**A local-first desktop app that finds U.S. companies matching a plain-language description, gathers public evidence for each one, and refuses to state anything it cannot cite.**
+A local-first desktop application for B2B prospect research. You describe what you sell in plain language; it finds U.S. companies that match, collects public evidence about each one, and will not state anything it cannot attribute to a source.
 
-Describe what you sell and who should care. The app compiles a search plan you can read and edit, discovers candidate companies from free public sources, reads their public web pages, scores fit with fixed rules in application code, and drafts outreach with a local 9B model — where every factual sentence must quote a stored evidence row or it is stripped before you see it.
+The app compiles a search plan you can read and edit before anything runs. It then discovers candidates from free public sources, reads their public web pages, scores fit using fixed rules in application code, and drafts outreach with a local 9B model. Every factual sentence in a draft must quote a stored evidence row, or it is removed before you see it.
 
-Everything runs on your machine. No account, no server, no telemetry, no paid data vendor, no hosted inference.
+Everything runs on your machine. There is no account, server, telemetry, paid data vendor, or hosted inference.
 
 ![A qualified prospect with its fit score, matched features and evidence count](docs/screenshots/qualification.png)
 
----
+## Design constraints
 
-## Why this was interesting to build
+The obvious way to build this is to wrap a paid contact database and a chat model. That approach invents contact details, manufactures reasons to reach out, and cannot show where any of it came from.
 
-The easy version of this product is a wrapper around a paid contact database and a chat model. That version invents contact details, manufactures reasons to reach out, and cannot tell you where anything came from.
+The rule I worked to instead was that the application may only assert what it can cite, and must say so plainly when it finds nothing. Most of the design follows from that.
 
-The constraint I set instead was: **the app may only assert what it can cite, and must say plainly when it finds nothing.** That one rule drove nearly every decision below and turned the project into an engineering problem rather than a prompt.
+Scoring lives in Rust rather than in the model. A model asked to produce a number can be argued into producing any number, so the weights are fixed at 35/30/20/15 and can be audited.
 
-| Decision | Why |
-| --- | --- |
-| Scoring lives in Rust, never in the model | A model asked for a number can be argued into any number. Weights are fixed at 35/30/20/15 and auditable. |
-| The model may write, never assert | A second verification pass checks each drafted claim against evidence IDs. Unsupported sentences are removed; a draft left with no cited reason is refused outright. |
-| Web pages are untrusted input, not context | Fetched HTML is stripped of active and hidden elements, scanned for embedded-instruction patterns, and quoted to the model as data. |
-| "Not publicly found" is a real answer | Missing contact data is shown as missing. Nothing is pattern-guessed from a domain. |
-| Sources must be free and rule-abiding | OpenStreetMap and Wikidata, both with published usage policies the client honours: bounded sampling, backoff, caching, mirrors. No search-result pages are ever scraped. |
+The model writes, but it does not assert. A second pass checks each drafted claim against evidence IDs, removes sentences it cannot support, and refuses a draft entirely if nothing cited survives.
 
-## What it does
+Fetched web pages are treated as untrusted input rather than context. HTML is stripped of active and hidden elements, scanned for embedded instruction patterns, and quoted to the model as data.
 
-**1 — Compile a plan you can read before anything runs.**
-A deterministic compiler turns your description into target segments, qualification signals, geography, and named discovery lanes. It runs offline and instantly, and lists every assumption it made so you can correct it. Nothing touches the network until you approve.
+Missing contact information is shown as missing. Nothing is guessed from a domain pattern.
 
-**2 — Discover from open sources.**
-Two automatic lanes with different shapes. OpenStreetMap covers businesses with a mapped premise — 94 curated verticals across all 50 states and ~50 metro areas. Wikidata covers organizations with no storefront at all: agencies, studios, firms. A third optional lane uses a SearXNG instance you run yourself.
+Sources have to be free and rule-abiding. OpenStreetMap and Wikidata both publish usage policies, and the client honours them through bounded sampling, backoff, caching and mirror failover. Search result pages are never scraped.
+
+## How it works
+
+**Compiling a plan.** A deterministic compiler turns your description into target segments, qualification signals, geography and named discovery lanes. It runs offline and returns immediately, and it lists the assumptions it made so you can correct them. Nothing touches the network until you approve the plan.
+
+**Discovery.** Two automatic lanes cover different shapes of company. OpenStreetMap handles businesses with a mapped physical premise, using a curated catalog of 94 verticals across all 50 states and roughly 50 metro areas. Wikidata handles organizations that have no storefront, such as agencies, studios and professional firms. A third optional lane uses a SearXNG instance you run yourself.
 
 ![A search running against public sources, streaming candidates as it goes](docs/screenshots/live-search.png)
 
-**3 — Research and qualify, with citations.**
-Each candidate's public pages are crawled within robots.txt, and focused excerpts become evidence rows. Fixed-weight scoring produces a fit score; only candidates within four points of the best eligible score become Strong Matches. Everything else stays visible as a near match with its reasons attached.
+**Research and qualification.** Each candidate's public pages are crawled within the limits of its robots.txt, and focused excerpts become evidence rows. Fixed-weight scoring produces a fit score. Only candidates within four points of the best eligible score are promoted to Strong Match; the rest stay visible as near matches with their reasons attached.
 
-**4 — Draft, verified.**
-A pinned local `qwen3.5:9b` composes an email and call brief through Ollama's structured output. A separate pass re-checks every claim against the evidence. The compliance footer is assembled from your own approved sender identity. The app never sends anything.
+**Drafting.** A pinned local `qwen3.5:9b` composes an email and call brief using Ollama's structured output. A separate pass re-checks every claim against the evidence. The compliance footer is built from the sender identity you approved. The application never sends anything.
 
-## Engineering worth a look
+## Implementation notes
 
-**Untrusted input handling** — [`safety.rs`](src-tauri/src/safety.rs) enforces scheme, port, credential and private-address policy, re-validating on every redirect hop, with content-type and size ceilings. Injection markers are stripped from page text before it reaches the model.
+*Untrusted input.* [`safety.rs`](src-tauri/src/safety.rs) enforces scheme, port, credential and private-address policy, and revalidates on every redirect hop. Content type and response size are capped. Injection markers are stripped from page text before it reaches the model.
 
-**Source-query safety** — generated text never becomes a source query. Overpass filters are `&'static str` literals in [`catalog.rs`](src-tauri/src/catalog.rs). The SPARQL in [`wikidata.rs`](src-tauri/src/wikidata.rs) is a fixed template whose only variable is an entity id validated against `^Q[1-9][0-9]*$`. The local model contributes plain-English type names, resolved through Wikidata's own search API before anything reaches a query.
+*Source query safety.* Generated text never becomes a source query. Overpass filters are `&'static str` literals in [`catalog.rs`](src-tauri/src/catalog.rs). The SPARQL in [`wikidata.rs`](src-tauri/src/wikidata.rs) is a fixed template whose only variable is an entity id validated against `^Q[1-9][0-9]*$`. The local model contributes plain English type names, which are resolved through Wikidata's own search API before anything reaches a query.
 
-**Evidence provenance** — a mapped business with no address tags records its location as the bounded region it was found in, labelled as established by the search area rather than by a published address. Proven and inferred facts stay distinguishable in the data model.
+*Evidence provenance.* A mapped business with no address tags records its location as the bounded region the query proved it was in, labelled as established by the search area rather than by a published address. Facts that were proven stay distinguishable from facts that were inferred.
 
-**Honest failure reporting** — a search stopped by its time budget reports how many candidates went unresearched instead of blaming its own scoring band. Rate-limited sources fall back to cache with the cache age shown.
+*Failure reporting.* A search stopped by its time budget reports how many candidates went unresearched instead of attributing the shortfall to its own scoring band. Rate-limited sources fall back to cache, with the cache age shown.
 
-**Testing** — parser fixtures cover malformed, duplicate, and injection-bearing payloads for every public source. Several tests encode measured findings from the live services, so a regression fails by name rather than vaguely.
+*Testing.* Parser fixtures cover malformed, duplicate and injection-bearing payloads for every public source. Several tests encode measured behaviour of the live services, so a regression fails by name rather than vaguely.
 
 ## Architecture
 
 ```
 React + TypeScript (Vite)          strict TS, no state library
-        │  Tauri IPC — typed commands, scoped capabilities
-        ▼
+        |  Tauri IPC: typed commands, scoped capabilities
+        v
 Rust core
-  ├── catalog.rs / regions.rs   curated verticals + U.S. bounding boxes
-  ├── adapters.rs               OpenStreetMap, SEC, USAspending, SearXNG
-  ├── wikidata.rs               open-ended organization discovery
-  ├── safety.rs                 fetch policy, SSRF defence, sanitisation
-  ├── research.rs               bounded crawl → evidence extraction
-  ├── qualification.rs          fixed-weight scoring, hard gates
-  ├── ai.rs                     Ollama structured output + verification
-  └── db.rs                     SQLite, migrations, serialized writes
-        │
-        ▼
-SQLite (app data dir)   ·   Ollama @ 127.0.0.1:11434
+  |-- catalog.rs / regions.rs   curated verticals, U.S. bounding boxes
+  |-- adapters.rs               OpenStreetMap, SEC, USAspending, SearXNG
+  |-- wikidata.rs               open-ended organization discovery
+  |-- safety.rs                 fetch policy, SSRF defence, sanitisation
+  |-- research.rs               bounded crawl, evidence extraction
+  |-- qualification.rs          fixed-weight scoring, hard gates
+  |-- ai.rs                     Ollama structured output, verification
+  |-- db.rs                     SQLite, migrations, serialized writes
+        |
+        v
+SQLite (app data dir)      Ollama @ 127.0.0.1:11434
 ```
 
-~11k lines of Rust, ~1.6k of TypeScript, 104 tests. CI runs both suites, a production build, `cargo fmt --check`, `clippy -D warnings`, and generates an SPDX SBOM.
+Roughly 11k lines of Rust and 1.6k of TypeScript, with 104 tests. CI runs both test suites, a production build, `cargo fmt --check` and `clippy -D warnings`, and generates an SPDX SBOM.
 
-## Running it
+## Requirements and setup
 
-Requires macOS 13+, Node 22+, Rust 1.80+, and [Ollama](https://ollama.com/).
+macOS 13 or later, Node 22+, Rust 1.80+, and [Ollama](https://ollama.com/).
 
 ```sh
 ollama pull qwen3.5:9b
@@ -85,16 +81,16 @@ pnpm install
 pnpm tauri dev
 ```
 
-`pnpm tauri build` produces a standalone `.app`. Discovery and research need internet access; stored records and local drafting work offline.
+`pnpm tauri build` produces a standalone `.app`. Discovery and research require internet access; stored records and local drafting work offline.
 
-> **macOS note:** keep the repository outside `~/Documents`, `~/Desktop`, and `~/Downloads`. macOS tags executables in those folders with a `com.apple.provenance` attribute that blocks the hardlinks cargo uses for build scripts, and Node fails at startup with `EPERM: uv_cwd` unless the terminal has been granted access to the folder.
+Keep the repository outside `~/Documents`, `~/Desktop` and `~/Downloads`. macOS tags executables in those directories with a `com.apple.provenance` attribute that blocks the hardlinks cargo uses for build scripts, and Node will fail at startup with `EPERM: uv_cwd` unless the terminal has been granted access to the folder.
 
-## Deliberate non-goals
+## Scope and limitations
 
-It does not send email, place calls, guess addresses, scrape LinkedIn or search-result pages, use paid databases, collect telemetry, or fall back to hosted AI. Coverage is bounded by what free public sources actually publish, and the app says so rather than filling gaps with plausible guesses. Outreach material is prepared for a human to review, edit, and send; the operator remains responsible for complying with applicable law.
+The application does not send email, place calls, guess addresses, scrape LinkedIn or search result pages, use paid databases, collect telemetry, or fall back to hosted AI. Coverage is bounded by what free public sources actually publish, and the app reports that rather than filling gaps with plausible guesses. Outreach material is prepared for a person to review, edit and send, and the operator remains responsible for complying with applicable law.
 
-## Status and next steps
+## Project status
 
-Working end to end on macOS. Known work in progress: run-view pagination for very large result sets, per-request discovery caching, and widening the qualification signal vocabulary beyond local service trades — a talent agency's website does not say "24/7 emergency service," so the scoring layer currently under-serves verticals the discovery layer can now reach.
+Working end to end on macOS. Outstanding work includes pagination in the run view for very large result sets, per-request discovery caching, and widening the qualification signal vocabulary beyond local service trades. A talent agency's website does not advertise "24/7 emergency service," so the scoring layer currently under-serves verticals that the discovery layer can now reach.
 
-See [SECURITY.md](SECURITY.md) for the threat model and [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions. Apache-2.0.
+See [SECURITY.md](SECURITY.md) for the threat model and [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions. Licensed under Apache-2.0.

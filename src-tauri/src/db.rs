@@ -1905,7 +1905,7 @@ pub fn finalize_search_ranking(
         .collect::<std::collections::HashSet<_>>();
     // The band is a window on the single best eligible score, never a
     // candidate-to-candidate comparison. Chaining the comparison lets a long
-    // gentle slope qualify as one cluster — 95, 84, 73 would all promote under
+    // gentle slope qualify as one cluster, 95, 84, 73 would all promote under
     // a 12-point band, a 22-point spread inside a "tight" tier. Strong Match
     // means "within `quality_band` of the best result", and README documents
     // that as a four-point span.
@@ -2376,7 +2376,7 @@ pub fn clear_search_history(connection: &Connection) -> AppResult<()> {
 ///
 /// Search history goes too, because a run whose candidates no longer exist is
 /// an empty row that can only confuse. The offer profile, sales play, and
-/// settings are preserved — this clears work, not configuration.
+/// settings are preserved, this clears work, not configuration.
 pub fn clear_prospects(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
         "DELETE FROM search_run_accounts;
