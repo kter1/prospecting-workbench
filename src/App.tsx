@@ -73,6 +73,38 @@ function openExternal(url: string, onError: (message: string) => void) {
   });
 }
 
+/**
+ * A confirmation the app draws itself.
+ *
+ * `window.confirm` does nothing in a Tauri webview — WKWebView has no JS dialog
+ * panel and the dialog plugin is not installed — so every destructive action
+ * guarded by it silently did nothing when clicked.
+ */
+type ConfirmRequest = {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+};
+
+function ConfirmDialog({ request, onDismiss }: { request: ConfirmRequest; onDismiss: () => void }) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onDismiss(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onDismiss]);
+  return <div className="modal-backdrop" role="presentation" onClick={onDismiss}>
+    <div className="modal panel confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onClick={(event) => event.stopPropagation()}>
+      <h2 id="confirm-title">{request.title}</h2>
+      <p>{request.body}</p>
+      <div className="receipt-actions">
+        <button type="button" className="button ghost" onClick={onDismiss}>Cancel</button>
+        <button type="button" className="button primary danger-solid" autoFocus onClick={() => { onDismiss(); request.onConfirm(); }}>{request.confirmLabel}</button>
+      </div>
+    </div>
+  </div>;
+}
+
 function GlobalSearchProgress({ run, onOpen, onCancel }: { run: SearchRun; onOpen: () => void; onCancel: () => void }) {
   const progress = searchProgress(run);
   return <section className="global-search-progress" aria-label="Active search progress">
@@ -108,6 +140,7 @@ function App() {
   const [draftSetup, setDraftSetup] = useState<{ readiness: DraftReadiness; kind: "initial" | "follow_up" }>();
   const [undoTrash, setUndoTrash] = useState<{ ids: string[]; until: number }>();
   const [discoverRevision, setDiscoverRevision] = useState(0);
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest>();
 
   const refresh = useCallback(async () => {
     try {
@@ -362,6 +395,7 @@ function App() {
           />
           <SettingsView
             capabilities={snapshot?.sourceCapabilities ?? []}
+            requestConfirm={setConfirmRequest}
             onExport={() => withBusy("export", async () => setNotice(`Export written to ${await api.exportData()}`))}
             onDiagnostics={() => withBusy("diagnostics", async () => setNotice(`Privacy-safe diagnostics written to ${await api.exportDiagnostics()}`))}
             onImport={(payload) => withBusy("import-data", async () => {
@@ -395,6 +429,7 @@ function App() {
             key={discoverRevision}
             capabilities={snapshot?.sourceCapabilities ?? []}
             recentRuns={snapshot?.searchRuns ?? []}
+            requestConfirm={setConfirmRequest}
             activeRun={activeRun}
             busy={busy}
             onInterpret={(query, geography, resultLimit, productWebsite) => api.interpretProspectingQuery(query, geography, resultLimit, productWebsite)}
@@ -444,6 +479,7 @@ function App() {
             busy={busy}
             draftJob={activeDraftJob}
             onError={setError}
+            requestConfirm={setConfirmRequest}
             onSelect={(id) => { setSelectedRunId(undefined); setSelectedId(id); }}
             onLibraryAction={(ids, action) => withBusy(`library-${action}`, async () => applyLibrary(ids, action))}
             onPermanentDelete={(ids) => withBusy("permanent-delete", async () => {
@@ -470,6 +506,8 @@ function App() {
             })}
           />
         )}
+
+        {confirmRequest && <ConfirmDialog request={confirmRequest} onDismiss={() => setConfirmRequest(undefined)} />}
 
         {draftSetup && <DraftSetupDialog
           readiness={draftSetup.readiness}
@@ -522,7 +560,7 @@ function SalesPlayEditor({ initial, busy, proposing, onPropose, onSave }: { init
   );
 }
 
-function DiscoverView({ capabilities, recentRuns, activeRun, busy, onInterpret, onStart, onCancel, onClearRun, onClearHistory, onOpenRun, onOpenAccount, onLibraryAction, onImport, onDiscover, onAddResults }: {
+function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfirm, onInterpret, onStart, onCancel, onClearRun, onClearHistory, onOpenRun, onOpenAccount, onLibraryAction, onImport, onDiscover, onAddResults }: {
   capabilities: DashboardSnapshot["sourceCapabilities"];
   recentRuns: SearchRunSummary[];
   activeRun?: SearchRun;
@@ -532,6 +570,7 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, onInterpret, 
   onCancel: () => void;
   onClearRun: () => void;
   onClearHistory: () => void;
+  requestConfirm: (request: ConfirmRequest) => void;
   onOpenRun: (runId: string) => Promise<void>;
   onOpenAccount: (accountId: string, runId: string) => void;
   onLibraryAction: (accountIds: string[], action: LibraryAction) => void;
@@ -690,7 +729,7 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, onInterpret, 
       {run.status !== "running" && <button className="button primary" onClick={() => { setBrief(undefined); setSelectedAccounts(new Set()); onClearRun(); }}>Start another search</button>}
     </section>}
 
-    {!run && recentRuns.length > 0 && <section className="panel"><div className="section-heading"><div><h3>Recent searches</h3></div><button className="button ghost danger-text" onClick={() => { if (confirm(`Clear all ${recentRuns.length} past searches? Saved prospects are kept.`)) onClearHistory(); }}>Clear history</button></div><div className="recent-runs">{recentRuns.slice(0, 5).map((item) => <button key={item.id} onClick={() => void onOpenRun(item.id)}><span><strong>{item.query}</strong><small>{item.strongCount} strong · {item.qualifiedCount} qualified · {item.reviewCount} review</small></span><Badge>{item.status}</Badge></button>)}</div></section>}
+    {!run && recentRuns.length > 0 && <section className="panel"><div className="section-heading"><div><h3>Recent searches</h3></div><button className="button ghost danger-text" onClick={() => requestConfirm({ title: "Clear search history?", body: `This removes all ${recentRuns.length} past searches and their cached results. Saved prospects are kept.`, confirmLabel: "Clear history", onConfirm: onClearHistory })}>Clear history</button></div><div className="recent-runs">{recentRuns.slice(0, 5).map((item) => <button key={item.id} onClick={() => void onOpenRun(item.id)}><span><strong>{item.query}</strong><small>{item.strongCount} strong · {item.qualifiedCount} qualified · {item.reviewCount} review</small></span><Badge>{item.status}</Badge></button>)}</div></section>}
 
     <details className="alternate-routes panel"><summary>Seeded and source-specific discovery</summary><div className="page-grid discover-grid">
       <section><h3>Import domains or CSV</h3><p>Contact details remain labeled as user-supplied evidence.</p><textarea className="seed-input" value={raw} onChange={(event) => setRaw(event.target.value)} placeholder={'example.com\nacme.test\n\n—or—\nCompany,Website,Person,Job Title,Work Email,Business Phone'} /><button className="button secondary wide" disabled={busy === "import"} onClick={() => onImport(raw)}>Import seeds</button></section>
@@ -700,8 +739,8 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, onInterpret, 
   </div>;
 }
 
-function ProspectsView({ accounts, selected, selectedId, busy, draftJob, onError, onSelect, onLibraryAction, onPermanentDelete, onResearch, onGenerate, onOutcome, onSuppress }: {
-  accounts: Account[]; selected?: ProspectPackage; selectedId?: string; busy?: string; draftJob?: ResearchJob; onError: (message: string) => void;
+function ProspectsView({ accounts, selected, selectedId, busy, draftJob, onError, requestConfirm, onSelect, onLibraryAction, onPermanentDelete, onResearch, onGenerate, onOutcome, onSuppress }: {
+  accounts: Account[]; selected?: ProspectPackage; selectedId?: string; busy?: string; draftJob?: ResearchJob; onError: (message: string) => void; requestConfirm: (request: ConfirmRequest) => void;
   onSelect: (id: string) => void; onLibraryAction: (ids: string[], action: LibraryAction) => void; onPermanentDelete: (ids: string[]) => void;
   onResearch: () => void; onGenerate: (kind?: "initial" | "follow_up") => void; onOutcome: (outcome: OutcomeKind) => void; onSuppress: (suppressed: boolean) => void;
 }) {
@@ -719,7 +758,7 @@ function ProspectsView({ accounts, selected, selectedId, busy, draftJob, onError
     <section className="account-list panel">
       <div className="library-tabs">{(["saved", "favorites", "all", "trash"] as const).map((value) => <button className={filter === value ? "active" : ""} onClick={() => { setFilter(value); setChecked(new Set()); }} key={value}>{value === "all" ? "All discovered" : value}</button>)}</div>
       <div className="list-heading"><button className="select-all" onClick={() => setChecked(checked.size === visible.length ? new Set() : new Set(visible.map((account) => account.id)))}>{checked.size === visible.length && visible.length ? "Clear all" : "Select all visible"}</button><span>{visible.length} accounts</span></div>
-      {checked.size > 0 && <div className="bulk-toolbar compact"><strong>{checked.size} selected</strong>{filter === "trash" ? <><button onClick={() => onLibraryAction([...checked], "restore")}>Restore</button><button className="danger-text" onClick={() => { if (confirm("Permanently delete the selected trashed prospects and all related evidence?")) onPermanentDelete([...checked]); }}>Delete permanently</button></> : <><button onClick={() => onLibraryAction([...checked], "save")}>Save</button><button onClick={() => onLibraryAction([...checked], "unsave")}>Unsave</button><button onClick={() => onLibraryAction([...checked], "favorite")}>Favorite</button><button onClick={() => onLibraryAction([...checked], "unfavorite")}>Unfavorite</button><button className="danger-text" onClick={() => onLibraryAction([...checked], "trash")}>Trash</button></>}</div>}
+      {checked.size > 0 && <div className="bulk-toolbar compact"><strong>{checked.size} selected</strong>{filter === "trash" ? <><button onClick={() => onLibraryAction([...checked], "restore")}>Restore</button><button className="danger-text" onClick={() => requestConfirm({ title: "Delete permanently?", body: `${checked.size} trashed prospect${checked.size === 1 ? "" : "s"} and all related evidence will be removed. This cannot be undone.`, confirmLabel: "Delete permanently", onConfirm: () => onPermanentDelete([...checked]) })}>Delete permanently</button></> : <><button onClick={() => onLibraryAction([...checked], "save")}>Save</button><button onClick={() => onLibraryAction([...checked], "unsave")}>Unsave</button><button onClick={() => onLibraryAction([...checked], "favorite")}>Favorite</button><button onClick={() => onLibraryAction([...checked], "unfavorite")}>Unfavorite</button><button className="danger-text" onClick={() => onLibraryAction([...checked], "trash")}>Trash</button></>}</div>}
       {visible.map((account) => <article key={account.id} className={selectedId === account.id ? "account-row selected" : "account-row"}>
         <button type="button" className={checked.has(account.id) ? "avatar selector selected" : "avatar selector"} aria-pressed={checked.has(account.id)} aria-label={`Select ${account.name}`} onClick={() => setChecked((current) => { const next = new Set(current); next.has(account.id) ? next.delete(account.id) : next.add(account.id); return next; })}>{checked.has(account.id) ? "✓" : account.name.slice(0, 2).toUpperCase()}</button>
         <button type="button" className="account-open" onClick={() => onSelect(account.id)}><span className="account-meta"><strong title={account.name}>{account.name}</strong><small title={account.domain ?? account.websiteUrl}>{account.domain ?? account.websiteUrl ?? "Public-source account"}</small></span><span className="score"><b>{account.score ?? "—"}</b><small>{account.scoreLabel ?? "Not scored"}</small></span></button>
@@ -750,13 +789,13 @@ function DraftSetupDialog({ readiness, busy, onCancel, onSubmit }: { readiness: 
   return <div className="modal-backdrop" role="presentation"><form className="modal panel" role="dialog" aria-modal="true" aria-labelledby="draft-setup-title" onSubmit={(event) => { event.preventDefault(); onSubmit(play, overrideReview); }}><div className="section-heading"><div><span className="step">Local draft setup</span><h2 id="draft-setup-title">Complete once, then generate</h2></div><button type="button" className="icon-button" aria-label="Close" onClick={onCancel}>×</button></div><p className="muted">These fields are stored only on this computer. Saving them approves the active sales play and resumes the Ollama request automatically.</p><div className="form-grid"><label className="span-2">Offer<textarea required value={play.offer} onChange={(event) => update("offer", event.target.value)} /></label><label>Sender name<input required value={play.senderName} onChange={(event) => update("senderName", event.target.value)} /></label><label>Sender company<input required value={play.senderCompany} onChange={(event) => update("senderCompany", event.target.value)} /></label><label className="span-2">Postal address<textarea required value={play.postalAddress} onChange={(event) => update("postalAddress", event.target.value)} /></label><label className="span-2">Opt-out wording<textarea required value={play.optOutText} onChange={(event) => update("optOutText", event.target.value)} /></label></div>{readiness.requiresReviewOverride && <label className="override-check"><input type="checkbox" checked={overrideReview} onChange={(event) => setOverrideReview(event.target.checked)} required /><span>I reviewed the evidence and want a draft even though this prospect is not currently a Strong Match.</span></label>}<div className="receipt-actions"><button type="button" className="button ghost" onClick={onCancel}>Cancel</button><button className="button primary" disabled={busy || readiness.requiresReviewOverride && !overrideReview}>{busy ? "Saving…" : "Save & Generate"}</button></div></form></div>;
 }
 
-function SettingsView({ capabilities, onExport, onDiagnostics, onImport, onClearProspects, onDelete }: { capabilities: DashboardSnapshot["sourceCapabilities"]; onExport: () => void; onDiagnostics: () => void; onImport: (payload: string) => void; onClearProspects: () => void; onDelete: () => void }) {
+function SettingsView({ capabilities, onExport, onDiagnostics, onImport, onClearProspects, onDelete, requestConfirm }: { capabilities: DashboardSnapshot["sourceCapabilities"]; onExport: () => void; onDiagnostics: () => void; onImport: (payload: string) => void; onClearProspects: () => void; onDelete: () => void; requestConfirm: (request: ConfirmRequest) => void }) {
   const [health, setHealth] = useState<OllamaHealth>();
   const [searxngUrl, setSearxngUrl] = useState("");
   const [sourceNotice, setSourceNotice] = useState("");
   useEffect(() => { void api.ollamaHealth().then(setHealth).catch(() => setHealth({ reachable: false, modelInstalled: false, modelTag: "qwen3.5:9b", message: "Ollama is not reachable." })); }, []);
   useEffect(() => { void api.getSearxngUrl().then(setSearxngUrl); }, []);
-  return <div className="page-grid"><section className="panel"><h2>Local model</h2><div className="health-card"><span className={health?.modelInstalled ? "health-icon ok" : "health-icon"}>◎</span><div><strong>{health?.modelTag ?? "Checking…"}</strong><p>{health?.message}</p></div></div><p className="muted">Requires 16 GB RAM and about 12 GB of free disk. The workbench never falls back to hosted AI.</p></section><section className="panel"><h2>Data controls</h2><p>All prospecting data lives in the local application directory. Raw HTML is discarded after evidence extraction.</p><div className="stack"><button className="button secondary" onClick={onExport}>Export local data</button><button className="button secondary" onClick={onDiagnostics}>Export privacy-safe diagnostics</button><label className="button ghost file-button">Restore local export<input type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (file.size > 25 * 1024 * 1024) { setSourceNotice("Import exceeds the 25 MB limit."); return; } if (confirm("Replace all local data with this export?")) void file.text().then(onImport); event.target.value = ""; }} /></label><button className="button ghost danger-text" onClick={() => { if (confirm("Remove every prospect, its evidence, and all search history? Your offer profile and settings are kept.")) onClearProspects(); }}>Clear all prospects</button><button className="button ghost danger-text" onClick={() => { if (confirm("Delete all local prospecting data? This cannot be undone.")) onDelete(); }}>Delete all data</button></div></section><section className="panel span-2"><h2>Optional local search</h2><p>SearXNG is never required. Add a base URL only if you operate your own instance; clearing it disables the adapter.</p><div className="inline-form"><input aria-label="SearXNG base URL" value={searxngUrl} onChange={(event) => setSearxngUrl(event.target.value)} placeholder="http://127.0.0.1:8080" /><button className="button secondary" onClick={() => void api.setSearxngUrl(searxngUrl).then((saved) => { setSearxngUrl(saved); setSourceNotice(saved ? "SearXNG configured." : "SearXNG disabled."); })}>Save source</button></div>{sourceNotice && <p className="muted">{sourceNotice}</p>}</section><section className="panel span-2"><h2>Source capabilities</h2><div className="source-grid">{capabilities.map((item) => <div key={item.id}><Badge tone={item.enabled ? "success" : "neutral"}>{item.enabled ? "Ready" : "Optional"}</Badge><strong>{item.name}</strong><p>{item.detail}</p></div>)}</div></section></div>;
+  return <div className="page-grid"><section className="panel"><h2>Local model</h2><div className="health-card"><span className={health?.modelInstalled ? "health-icon ok" : "health-icon"}>◎</span><div><strong>{health?.modelTag ?? "Checking…"}</strong><p>{health?.message}</p></div></div><p className="muted">Requires 16 GB RAM and about 12 GB of free disk. The workbench never falls back to hosted AI.</p></section><section className="panel"><h2>Data controls</h2><p>All prospecting data lives in the local application directory. Raw HTML is discarded after evidence extraction.</p><div className="stack"><button className="button secondary" onClick={onExport}>Export local data</button><button className="button secondary" onClick={onDiagnostics}>Export privacy-safe diagnostics</button><label className="button ghost file-button">Restore local export<input type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (file.size > 25 * 1024 * 1024) { setSourceNotice("Import exceeds the 25 MB limit."); return; } requestConfirm({ title: "Replace all local data?", body: `Importing ${file.name} replaces every prospect, evidence row and search in this app. This cannot be undone.`, confirmLabel: "Replace everything", onConfirm: () => void file.text().then(onImport) }); event.target.value = ""; }} /></label><button className="button ghost danger-text" onClick={() => requestConfirm({ title: "Clear all prospects?", body: "Every prospect, its evidence, contacts and drafts will be removed, along with all search history. Your offer profile, sender identity and settings are kept.", confirmLabel: "Clear prospects", onConfirm: onClearProspects })}>Clear all prospects</button><button className="button ghost danger-text" onClick={() => requestConfirm({ title: "Delete everything?", body: "All prospects, evidence, searches, drafts, your offer profile and every setting will be erased. Export first if you want a copy. This cannot be undone.", confirmLabel: "Delete all data", onConfirm: onDelete })}>Delete all data</button></div></section><section className="panel span-2"><h2>Optional local search</h2><p>SearXNG is never required. Add a base URL only if you operate your own instance; clearing it disables the adapter.</p><div className="inline-form"><input aria-label="SearXNG base URL" value={searxngUrl} onChange={(event) => setSearxngUrl(event.target.value)} placeholder="http://127.0.0.1:8080" /><button className="button secondary" onClick={() => void api.setSearxngUrl(searxngUrl).then((saved) => { setSearxngUrl(saved); setSourceNotice(saved ? "SearXNG configured." : "SearXNG disabled."); })}>Save source</button></div>{sourceNotice && <p className="muted">{sourceNotice}</p>}</section><section className="panel span-2"><h2>Source capabilities</h2><div className="source-grid">{capabilities.map((item) => <div key={item.id}><Badge tone={item.enabled ? "success" : "neutral"}>{item.enabled ? "Ready" : "Optional"}</Badge><strong>{item.name}</strong><p>{item.detail}</p></div>)}</div></section></div>;
 }
 
 function EmptyState() {
