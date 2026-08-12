@@ -629,7 +629,7 @@ mod tests {
         // The yield bug this guards: an OpenStreetMap element with no addr:*
         // tags used to arrive with location = None. The geography hard gate
         // then resolved "unknown", `state` could never become "qualified", and
-        // finalize_search_ranking could never promote it to a strong match —
+        // finalize_search_ranking could never promote it to a strong match,
         // however good the company was. Discovery now records the bounded
         // region the element was found in, which is a fact the query proved.
         let mut package = package();

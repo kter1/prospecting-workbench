@@ -1,8 +1,8 @@
 //! Open-ended organization discovery through Wikidata.
 //!
 //! The OpenStreetMap lane only sees businesses with a mapped physical premise,
-//! so whole industries — talent and literary agencies, studios, publishers,
-//! consultancies without a storefront — had no automatic path at all. Wikidata
+//! so whole industries, talent and literary agencies, studios, publishers,
+//! consultancies without a storefront, had no automatic path at all. Wikidata
 //! is a general organization graph with a class item per industry, so any
 //! legitimate audience that exists as a described type of organization can be
 //! discovered here.
@@ -308,8 +308,8 @@ pub async fn resolve_classes(
 /// Fetch one page of instances, wrapping to the start if the page is past the
 /// end of the class.
 ///
-/// Reference-data classes are often small — there are 30 U.S. talent agencies
-/// in total — while the rotation offset is sized for the map lane, where a
+/// Reference-data classes are often small, there are 30 U.S. talent agencies
+/// in total, while the rotation offset is sized for the map lane, where a
 /// class has thousands of members. A third repeat search asked for rows 150+
 /// of 30 and got nothing, which surfaced as "no usable candidates" even though
 /// the class had resolved perfectly.
