@@ -1,72 +1,42 @@
 #!/usr/bin/env bash
-# Capture the three README screenshots.
+# Capture the one screenshot still missing from the README.
 #
 #   bash docs/screenshots/capture.sh
 #
-# Each step tells you exactly what must be on screen before you capture.
-# If what you see does not match, fix it first — a mismatched frame is worse
-# than no frame, because the README caption will describe something else.
+# qualification.png is already in place. This captures live-search.png:
+# a search actually running against public sources.
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-shot() {
-  local file="$1" title="$2"; shift 2
-  echo
-  echo "══════════════════════════════════════════════════════════"
-  echo "  $title"
-  echo "  → $file"
-  echo "══════════════════════════════════════════════════════════"
-  for line in "$@"; do echo "     $line"; done
-  echo
-  read -r -p "  Matches what you see? Enter to capture, then click the window… "
-  screencapture -w "$file"
-  if [ -f "$file" ]; then
-    sips -Z 1600 "$file" >/dev/null 2>&1 || true
-    echo "  ✓ saved ($(du -h "$file" | cut -f1))"
-  else
-    echo "  ✗ cancelled — re-run the script to retry this shot"
-  fi
-}
-
 cat <<'INTRO'
 ══════════════════════════════════════════════════════════
-  Prepare first — this matters
+  live-search.png — a search in progress
 ══════════════════════════════════════════════════════════
-  Two shots are needed. qualification.png is already captured.
-
-  1. Discover. Paste this, geography United States, limit 10:
+  1. Discover tab. Type anything real, for example:
 
      I sell a voice intake system to businesses that depend on
-     inbound calls. Find companies showing evidence of after-hours,
-     appointment, or dispatch workflows.
+     inbound calls.
 
-  2. Press "Build search plan" — but do NOT start the search yet.
-     Shot 1 is the plan. Then start it, let it finish, and open a
-     prospect for shot 2.
+  2. Build search plan → Start search.
+  3. While it is still running, capture. The frame wants the
+     progress bar, the stage line ("Searching Mapped local
+     businesses"), and the elapsed timer.
+
+  Company names and domains are fine to show. Avoid your own
+  sender identity and any personal or mobile number.
 INTRO
 
-shot "search-plan.png" "SHOT 1 of 2 — the compiled plan, before the run" \
-  "ON SCREEN: Discover tab. A panel headed 'Review this plan, then start'." \
-  "MUST SEE:  the segments/signals it inferred, the discovery lanes with" \
-  "           automatic/guided labels, and the 'Assumptions to review' list." \
-  "NOT THIS:  the empty form with grey placeholder text (plan not built)." \
-  "NOT THIS:  a running search with a progress bar."
+read -r -p "  Search running? Press Enter, then click the app window… "
+screencapture -w live-search.png
 
-shot "evidence-ledger.png" "SHOT 2 of 2 — evidence ledger" \
-  "ON SCREEN: Prospects tab, one account selected, scrolled to 'Evidence ledger'." \
-  "MUST SEE:  an expanded excerpt with its source link and freshness label." \
-  "PICK WELL: an account whose contacts read 'Not publicly found' makes the" \
-  "           strongest frame — it demonstrates the central claim directly." \
-  "FINE:      company names, domains and a business main line are public." \
-  "NOT THIS:  a personal or mobile number, or your own sender identity."
-
-echo
-echo "══════════════════════════════════════════════════════════"
-echo "  Check before committing"
-echo "══════════════════════════════════════════════════════════"
-echo "  • no personal/mobile number or your own sender identity visible"
-echo "  • no unrelated windows or menu bar captured"
-ls -lh ./*.png 2>/dev/null | awk '{print "  •", $9, $5}'
-echo
-echo "  Then tell Claude — the images are verified before they are committed."
+if [ -f live-search.png ]; then
+  sips -Z 1600 live-search.png >/dev/null 2>&1 || true
+  echo "  ✓ saved live-search.png ($(du -h live-search.png | cut -f1))"
+  echo
+  ls -lh ./*.png | awk '{print "  •", $9, $5}'
+  echo
+  echo "  Tell Claude — it will check the frame before committing."
+else
+  echo "  ✗ cancelled — re-run to retry"
+fi

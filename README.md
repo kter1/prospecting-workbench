@@ -32,12 +32,10 @@ A deterministic compiler turns your description into target segments, qualificat
 **2 — Discover from open sources.**
 Two automatic lanes with different shapes. OpenStreetMap covers businesses with a mapped premise — 94 curated verticals across all 50 states and ~50 metro areas. Wikidata covers organizations with no storefront at all: agencies, studios, firms. A third optional lane uses a SearXNG instance you run yourself.
 
-![The compiled search plan, shown before any source is contacted](docs/screenshots/search-plan.png)
+![A search running against public sources, streaming candidates as it goes](docs/screenshots/live-search.png)
 
 **3 — Research and qualify, with citations.**
 Each candidate's public pages are crawled within robots.txt, and focused excerpts become evidence rows. Fixed-weight scoring produces a fit score; only candidates within four points of the best eligible score become Strong Matches. Everything else stays visible as a near match with its reasons attached.
-
-![Evidence ledger with sourced excerpts and freshness labels](docs/screenshots/evidence-ledger.png)
 
 **4 — Draft, verified.**
 A pinned local `qwen3.5:9b` composes an email and call brief through Ollama's structured output. A separate pass re-checks every claim against the evidence. The compliance footer is assembled from your own approved sender identity. The app never sends anything.
