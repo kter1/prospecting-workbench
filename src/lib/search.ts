@@ -29,7 +29,7 @@ export function shortfallExplanation(
 ): string {
   const unresearched = Math.max(0, run.candidateCount - run.researchedCount);
   if (unresearched > 0) {
-    return `${unresearched} of ${run.candidateCount} discovered candidate${run.candidateCount === 1 ? "" : "s"} ${unresearched === 1 ? "was" : "were"} not researched before the search reached its time budget. Those were not rejected — they were never checked. Run the search again to continue.`;
+    return `${unresearched} of ${run.candidateCount} discovered candidate${run.candidateCount === 1 ? "" : "s"} ${unresearched === 1 ? "was" : "were"} not researched before the search reached its time budget. Those were not rejected, they were never checked. Run the search again to continue.`;
   }
   if (run.candidateCount === 0) {
     return "No candidates were discovered from the enabled free sources for this brief.";
@@ -106,7 +106,7 @@ export function safePublicWebsite(value?: string): string | undefined {
  * A placeholder brief for the browser preview, where no Tauri backend exists.
  *
  * This is deliberately NOT a second targeting compiler. It used to mirror the
- * Rust category and signal tables, and the two copies had already drifted —
+ * Rust category and signal tables, and the two copies had already drifted:
  * different keywords, a missing rule, a hardcoded prompt version. The real
  * compiler lives in `src-tauri/src/catalog.rs` and now covers far more
  * verticals than any duplicate here could track. The preview returns a

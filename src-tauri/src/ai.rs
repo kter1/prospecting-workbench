@@ -341,8 +341,8 @@ pub async fn interpret_search_brief(
     if lower.contains("government") || lower.contains("federal") || lower.contains("contractor") {
         lanes.push(DiscoveryLane { id:"award-recipients".into(),label:"Federal award recipients".into(),mode:"guided".into(),source:"usaspending".into(),reason:"USAspending can resolve recipient names but is not a general contractor-category directory.".into(),limitation:"Recipient lookup by name only; identity may require review.".into() });
     }
-    // Open reference data covers organizations that have no mapped premise —
-    // agencies, studios, publishers, firms without a storefront — so a query
+    // Open reference data covers organizations that have no mapped premise,
+    // agencies, studios, publishers, firms without a storefront, so a query
     // that matches no curated map category still has an automatic route.
     // Resolution happens at search time; planning stays offline and instant.
     if !reference_terms(query).is_empty() {
@@ -507,7 +507,7 @@ fn manual_search_proposal(query: &str, play: Option<&SalesPlay>) -> SearchBriefP
             Vec::new()
         },
         assumptions: vec![
-            "The business types below were inferred from your description. Edit them if they are wrong — nothing is searched until you approve this plan."
+            "The business types below were inferred from your description. Edit them if they are wrong, nothing is searched until you approve this plan."
                 .into(),
         ],
     }
