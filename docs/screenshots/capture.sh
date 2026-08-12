@@ -1,66 +1,78 @@
 #!/usr/bin/env bash
 # Capture the three README screenshots.
 #
-# Run this, then follow the prompts. For each shot you set the app up, press
-# Enter, and click the app window once. macOS writes a clean PNG with the
-# window shadow, so nothing needs cropping.
-#
 #   bash docs/screenshots/capture.sh
+#
+# Each step tells you exactly what must be on screen before you capture.
+# If what you see does not match, fix it first — a mismatched frame is worse
+# than no frame, because the README caption will describe something else.
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 shot() {
-  local file="$1" title="$2" setup="$3" must_show="$4"
+  local file="$1" title="$2"; shift 2
   echo
-  echo "──────────────────────────────────────────────────────────"
-  echo "  $title  →  $file"
-  echo "──────────────────────────────────────────────────────────"
-  echo "  Set up:     $setup"
-  echo "  Must show:  $must_show"
+  echo "══════════════════════════════════════════════════════════"
+  echo "  $title"
+  echo "  → $file"
+  echo "══════════════════════════════════════════════════════════"
+  for line in "$@"; do echo "     $line"; done
   echo
-  read -r -p "  Ready? Press Enter, then click the app window… "
+  read -r -p "  Matches what you see? Enter to capture, then click the window… "
   screencapture -w "$file"
   if [ -f "$file" ]; then
     sips -Z 1600 "$file" >/dev/null 2>&1 || true
-    echo "  ✓ saved $(du -h "$file" | cut -f1)"
+    echo "  ✓ saved ($(du -h "$file" | cut -f1))"
   else
-    echo "  ✗ not saved (capture cancelled)"
+    echo "  ✗ cancelled — re-run the script to retry this shot"
   fi
 }
 
 cat <<'INTRO'
-Screenshot capture — three images for the README.
+══════════════════════════════════════════════════════════
+  Prepare first — this matters
+══════════════════════════════════════════════════════════
+  1. Setup → "Clear all prospects" → confirm.
+     Removes real company data so none of it is published.
 
-First, so no real company's contact details end up in a public repo:
-  Setup → "Clear all prospects", then run one search worth showing.
+  2. Discover. Paste this, geography United States, limit 10:
 
-  Query:      I sell a voice intake system to businesses that depend on
-              inbound calls. Find companies showing evidence of after-hours,
-              appointment, or dispatch workflows.
-  Geography:  Ohio
-  Limit:      Up to 10 strong matches
+     I sell a voice intake system to businesses that depend on
+     inbound calls. Find companies showing evidence of after-hours,
+     appointment, or dispatch workflows.
 
-Let the run finish before starting.
+  3. Press "Build search plan" — but do NOT start the search yet.
+     Shot 1 is the plan. Then start it and let it finish for shots 2 and 3.
 INTRO
 
-shot "01-discover.png" "Discover — plan compiled" \
-  "Discover tab, after 'Build search plan', before starting the run." \
-  "Your description, the compiled plan, discovery lanes with automatic/guided labels, and the assumptions list."
+shot "01-discover.png" "SHOT 1 — the compiled plan, before the run" \
+  "ON SCREEN: Discover tab. A panel headed 'Review this plan, then start'." \
+  "MUST SEE:  the segments/signals it inferred, the discovery lanes with" \
+  "           automatic/guided labels, and the 'Assumptions to review' list." \
+  "NOT THIS:  the empty form with grey placeholder text (plan not built)." \
+  "NOT THIS:  a running search with a progress bar."
 
-shot "02-results.png" "Discover — run finished" \
-  "Same tab once the run completes." \
-  "100% progress, the discovered/researched/requested counts, and both Strong and Near Match sections with fit scores."
+shot "02-results.png" "SHOT 2 — finished results" \
+  "ON SCREEN: Discover tab, the run panel says complete (not a % in progress)." \
+  "MUST SEE:  the counts line (discovered / researched / requested) and at" \
+  "           least one of 'Strong Matches' or 'Near Matches' with fit scores." \
+  "NOT THIS:  a progress bar mid-run, or '0/0 researched'."
 
-shot "03-evidence.png" "Prospects — evidence ledger" \
-  "Prospects tab, one account selected, evidence ledger expanded." \
-  "A real excerpt with its source and freshness label, plus the qualification panel with hard gates and cited reasons."
+shot "03-evidence.png" "SHOT 3 — evidence ledger" \
+  "ON SCREEN: Prospects tab, one account selected, scrolled to 'Evidence ledger'." \
+  "MUST SEE:  an expanded excerpt with its source link and freshness label." \
+  "PICK WELL: choose an account whose 'People and business contacts' panel" \
+  "           reads 'Not publicly found'. That frame proves the honesty claim" \
+  "           AND avoids publishing a real company's phone number." \
+  "NOT THIS:  any frame showing a real phone number or email address."
 
 echo
-echo "──────────────────────────────────────────────────────────"
-echo "Check before committing:"
-echo "  • no personal email, phone, or sender identity visible"
-echo "  • no unrelated windows or menu-bar content captured"
+echo "══════════════════════════════════════════════════════════"
+echo "  Check before committing"
+echo "══════════════════════════════════════════════════════════"
+echo "  • no phone number, email, or sender identity visible"
+echo "  • no unrelated windows or menu bar captured"
 ls -lh ./*.png 2>/dev/null | awk '{print "  •", $9, $5}'
 echo
-echo "Then commit them."
+echo "  Then verify the images before committing them."
