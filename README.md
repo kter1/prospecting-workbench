@@ -1,107 +1,102 @@
 # Prospecting Workbench
 
-Prospecting Workbench is a free, Apache-2.0, local-first desktop application for evidence-backed U.S. B2B prospect research. Describe what you sell in plain language, review the targeting assumptions, and the workbench uses enabled free public sources to find and qualify candidates without pretending those sources provide exhaustive coverage.
+**A local-first desktop app that finds U.S. companies matching a plain-language description, gathers public evidence for each one, and refuses to state anything it cannot cite.**
 
-It does **not** send email, place calls, guess addresses, scrape LinkedIn or search-result pages, use paid databases, provide telemetry, or fall back to hosted AI. Apollo.io is not used or required.
+Describe what you sell and who should care. The app compiles a search plan you can read and edit, discovers candidate companies from free public sources, reads their public web pages, scores fit with fixed rules in application code, and drafts outreach with a local 9B model — where every factual sentence must quote a stored evidence row or it is stripped before you see it.
 
-## What is implemented
+Everything runs on your machine. No account, no server, no telemetry, no paid data vendor, no hosted inference.
 
-- Prompt-first discovery with an editable, versioned search brief and explicit automatic/guided coverage labels.
-- A stable offer profile separated from immutable per-query search runs.
-- Bounded OpenStreetMap Overpass discovery across a curated catalog of roughly 90 U.S. business verticals and every U.S. state plus about 50 metro areas, with attribution and no model-generated source queries. Requests rotate across mirrors and across bounded regions, so repeating a search samples new ground.
-- Progressive, cancellable, resumable search runs with run-keyed progress, overlap prevention, recovery after restart, and independent per-query assessments.
-- Quality-first retrieval that discovers a broader pool before research, returns up to the requested number of strong matches, enforces the visible threshold and four-point primary score band, and separates near matches from excluded diagnostics.
-- A 24-hour normalized Overpass cache, persistent source backoff, cached-result age warnings, partial-source success, and deterministic pre-ranking before batched research.
-- Seed import from domains, URLs, and CSV, including conservative normalization and deduplication.
-- Guided browser queries that the user opens and reviews manually.
-- Free public-source discovery through SEC EDGAR and USAspending, plus optional user-operated SearXNG.
-- Company-site research across permitted public company, contact, leadership, careers, news, feed, Greenhouse, and Lever pages.
-- Supplemental GDELT news and exact-identity GitHub organization signals.
-- Robots handling, redirect revalidation, private-address and unsafe-scheme blocking, response/type limits, and `Retry-After` errors.
-- SQLite evidence ledger, serialized writes, resumable local jobs, content hashes, HTTP cache metadata, derived freshness labels, suppression, and manual outcomes.
-- Saved, Favorites, All Discovered, and Trash library views with independent selection controls, transactional bulk actions, eight-second trash undo, and confirmed trash-only permanent deletion.
-- Fixed 35/30/20/15 scoring in application code. Search planning is always a deterministic local compiler that selects from the curated catalog and never contacts a model. Local AI proposes the offer profile and writes cited artifacts, never numeric scores or source queries.
-- Multiple focused evidence excerpts per page for workflow, hiring, location, identity, and contact facts; raw HTML is discarded.
-- Pinned local `qwen3.5:9b` generation through Ollama JSON-schema output, readiness checks, persisted milestone progress, idempotent artifact saving, and a separate citation verification pass.
-- Deterministic fake provider, plus fixture tests covering every public-source parser against well-formed, malformed, duplicated, and injection-bearing payloads. The fake-provider button only appears in development builds.
-- Version 3 local JSON export with v1/v2 import compatibility, full deletion, source health, model health, saved-account-only daily scans while the app is open, and missed-scan catch-up at launch.
+![Discover view with a compiled search plan](docs/screenshots/01-discover.png)
 
-## Requirements
+---
 
-- macOS 13 or newer for the currently validated desktop target.
-- Apple Silicon recommended, 16 GB RAM, and approximately 12 GB of free disk.
-- Node.js 22+, pnpm 11+, Rust 1.77.2+, Xcode Command Line Tools.
-- [Ollama](https://ollama.com/) and the local model:
+## Why this was interesting to build
+
+The easy version of this product is a wrapper around a paid contact database and a chat model. That version invents contact details, manufactures reasons to reach out, and cannot tell you where anything came from.
+
+The constraint I set instead was: **the app may only assert what it can cite, and must say plainly when it finds nothing.** That one rule drove nearly every decision below and turned the project into an engineering problem rather than a prompt.
+
+| Decision | Why |
+| --- | --- |
+| Scoring lives in Rust, never in the model | A model asked for a number can be argued into any number. Weights are fixed at 35/30/20/15 and auditable. |
+| The model may write, never assert | A second verification pass checks each drafted claim against evidence IDs. Unsupported sentences are removed; a draft left with no cited reason is refused outright. |
+| Web pages are untrusted input, not context | Fetched HTML is stripped of active and hidden elements, scanned for embedded-instruction patterns, and quoted to the model as data. |
+| "Not publicly found" is a real answer | Missing contact data is shown as missing. Nothing is pattern-guessed from a domain. |
+| Sources must be free and rule-abiding | OpenStreetMap and Wikidata, both with published usage policies the client honours: bounded sampling, backoff, caching, mirrors. No search-result pages are ever scraped. |
+
+## What it does
+
+**1 — Compile a plan you can read before anything runs.**
+A deterministic compiler turns your description into target segments, qualification signals, geography, and named discovery lanes. It runs offline and instantly, and lists every assumption it made so you can correct it. Nothing touches the network until you approve.
+
+**2 — Discover from open sources.**
+Two automatic lanes with different shapes. OpenStreetMap covers businesses with a mapped premise — 94 curated verticals across all 50 states and ~50 metro areas. Wikidata covers organizations with no storefront at all: agencies, studios, firms. A third optional lane uses a SearXNG instance you run yourself.
+
+![Ranked results split into strong and near matches](docs/screenshots/02-results.png)
+
+**3 — Research and qualify, with citations.**
+Each candidate's public pages are crawled within robots.txt, and focused excerpts become evidence rows. Fixed-weight scoring produces a fit score; only candidates within four points of the best eligible score become Strong Matches. Everything else stays visible as a near match with its reasons attached.
+
+![Evidence ledger showing sourced excerpts](docs/screenshots/03-evidence.png)
+
+**4 — Draft, verified.**
+A pinned local `qwen3.5:9b` composes an email and call brief through Ollama's structured output. A separate pass re-checks every claim against the evidence. The compliance footer is assembled from your own approved sender identity. The app never sends anything.
+
+## Engineering worth a look
+
+**Untrusted input handling** — [`safety.rs`](src-tauri/src/safety.rs) enforces scheme, port, credential and private-address policy, re-validating on every redirect hop, with content-type and size ceilings. Injection markers are stripped from page text before it reaches the model.
+
+**Source-query safety** — generated text never becomes a source query. Overpass filters are `&'static str` literals in [`catalog.rs`](src-tauri/src/catalog.rs). The SPARQL in [`wikidata.rs`](src-tauri/src/wikidata.rs) is a fixed template whose only variable is an entity id validated against `^Q[1-9][0-9]*$`. The local model contributes plain-English type names, resolved through Wikidata's own search API before anything reaches a query.
+
+**Evidence provenance** — a mapped business with no address tags records its location as the bounded region it was found in, labelled as established by the search area rather than by a published address. Proven and inferred facts stay distinguishable in the data model.
+
+**Honest failure reporting** — a search stopped by its time budget reports how many candidates went unresearched instead of blaming its own scoring band. Rate-limited sources fall back to cache with the cache age shown.
+
+**Testing** — parser fixtures cover malformed, duplicate, and injection-bearing payloads for every public source. Several tests encode measured findings from the live services, so a regression fails by name rather than vaguely.
+
+## Architecture
+
+```
+React + TypeScript (Vite)          strict TS, no state library
+        │  Tauri IPC — typed commands, scoped capabilities
+        ▼
+Rust core
+  ├── catalog.rs / regions.rs   curated verticals + U.S. bounding boxes
+  ├── adapters.rs               OpenStreetMap, SEC, USAspending, SearXNG
+  ├── wikidata.rs               open-ended organization discovery
+  ├── safety.rs                 fetch policy, SSRF defence, sanitisation
+  ├── research.rs               bounded crawl → evidence extraction
+  ├── qualification.rs          fixed-weight scoring, hard gates
+  ├── ai.rs                     Ollama structured output + verification
+  └── db.rs                     SQLite, migrations, serialized writes
+        │
+        ▼
+SQLite (app data dir)   ·   Ollama @ 127.0.0.1:11434
+```
+
+~11k lines of Rust, ~1.6k of TypeScript, 104 tests. CI runs both suites, a production build, `cargo fmt --check`, `clippy -D warnings`, and generates an SPDX SBOM.
+
+## Running it
+
+Requires macOS 13+, Node 22+, Rust 1.80+, and [Ollama](https://ollama.com/).
 
 ```sh
 ollama pull qwen3.5:9b
-```
-
-Research and discovery need internet access. Existing records and local generation remain available offline after the model is installed. Windows and Linux are not yet claimed as supported targets.
-
-## Run locally
-
-```sh
+corepack enable
 pnpm install
 pnpm tauri dev
 ```
 
-The application creates its SQLite database in the operating system’s application-data directory. It has no login, server, cloud sync, analytics, or localhost HTTP API. Ollama is contacted only at `127.0.0.1:11434`; a configured loopback SearXNG service is a separate, explicit opt-in.
+`pnpm tauri build` produces a standalone `.app`. Discovery and research need internet access; stored records and local drafting work offline.
 
-## Workflow
+> **macOS note:** keep the repository outside `~/Documents`, `~/Desktop`, and `~/Downloads`. macOS tags executables in those folders with a `com.apple.provenance` attribute that blocks the hardlinks cargo uses for build scripts, and Node fails at startup with `EPERM: uv_cwd` unless the terminal has been granted access to the folder.
 
-1. Describe the product, desired customer, and business outcome on Discover.
-2. Review the compact search plan, its assumptions, source coverage, geography, and qualification threshold.
-3. Approve the plan. Automatic candidates stream through discovery, screening, research, and deterministic qualification.
-4. Review cited evidence and contacts. Missing business contact data is displayed as “not publicly found.”
-5. Save promising accounts or use seeded/guided discovery where no compliant free directory exists.
-6. Add sender identity, postal address, and opt-out language before generating a ready-to-use commercial draft.
-7. Review the verified package, record an outcome, or suppress the account.
+## Deliberate non-goals
 
-Query interpretation never needs Ollama: the search plan is compiled instantly and deterministically from the curated catalog, and every rule stays visible and editable before approval. Ollama is used for the optional offer-profile proposal and for drafting. Seed import and stored records remain usable; there is never a hosted-model fallback.
+It does not send email, place calls, guess addresses, scrape LinkedIn or search-result pages, use paid databases, collect telemetry, or fall back to hosted AI. Coverage is bounded by what free public sources actually publish, and the app says so rather than filling gaps with plausible guesses. Outreach material is prepared for a human to review, edit, and send; the operator remains responsible for complying with applicable law.
 
-The tool prepares material for human review only. It never sends or schedules outreach.
+## Status and next steps
 
-## Verification
+Working end to end on macOS. Known work in progress: run-view pagination for very large result sets, per-request discovery caching, and widening the qualification signal vocabulary beyond local service trades — a talent agency's website does not say "24/7 emergency service," so the scoring layer currently under-serves verticals the discovery layer can now reach.
 
-```sh
-pnpm test
-pnpm build
-cargo test --manifest-path src-tauri/Cargo.toml
-pnpm run generate:sbom
-```
-
-With Ollama running and the pinned model installed, run the release-only real-model gate:
-
-```sh
-pnpm run eval:golden
-```
-
-It writes `artifacts/real-model-golden.txt`; attach that summary alongside the unsigned build and SBOM.
-
-Live-adapter checks are intentionally not part of CI; source behavior and rate limits change. CI uses deterministic fixtures and the fake AI path. A release must additionally run the real-model golden evaluation on a 16 GB Apple Silicon machine before an unsigned macOS artifact is published.
-
-## Public source notes
-
-- [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces)
-- [USAspending API](https://api.usaspending.gov/docs/endpoints)
-- [Greenhouse job board API](https://developers.greenhouse.io/job-board.html)
-- [SearXNG search API](https://docs.searxng.org/dev/search_api.html)
-- [OpenStreetMap Overpass API](https://wiki.openstreetmap.org/wiki/Overpass_API)
-- [OpenStreetMap copyright and ODbL attribution](https://www.openstreetmap.org/copyright)
-- [Public Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/)
-- [Ollama structured outputs](https://docs.ollama.com/capabilities/structured-outputs)
-
-OpenStreetMap results are bounded samples and require attribution. Geographies resolve against a static bounding-box table; the public Nominatim service is not used for systematic business enumeration. When a mapped business carries no address tags, its location is recorded as the bounded search area it was found in — a fact the query establishes — and labeled as such in its evidence. All coverage is bounded by public availability. “Not publicly found” is a valid result, not a prompt to infer or buy enrichment.
-
-A search that reaches its time budget reports how many discovered candidates went unresearched. Those candidates were not rejected, and the app says so rather than attributing the shortfall to its scoring band.
-
-## Safety and compliance boundary
-
-- Page content is stripped of active/hidden elements and common embedded instruction patterns, then quoted to the model as untrusted evidence.
-- Every contact and signal requires an evidence row. Emails are never created from patterns, and personal/mobile numbers are excluded.
-- A draft cannot be created for a suppressed account.
-- The required footer is appended from the approved sender identity, postal address, and opt-out wording.
-- Operators remain responsible for determining whether and how to use a reviewed draft and for complying with applicable law.
-
-See [SECURITY.md](SECURITY.md) for the threat model and [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions.
+See [SECURITY.md](SECURITY.md) for the threat model and [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions. Apache-2.0.
