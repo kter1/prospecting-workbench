@@ -149,7 +149,7 @@ async fn crawl_account_with_page_budget(
 /// Public job boards the crawler may follow off the company's own domain.
 ///
 /// Matched on a dot boundary. `host.ends_with("lever.co")` also accepted
-/// `mylever.co` and `notlever.co` — registrable domains, not subdomains — so a
+/// `mylever.co` and `notlever.co`, registrable domains, not subdomains, so a
 /// link on a crawled page could steer the crawler to an attacker-controlled
 /// host, and the fetched content was then stored as `careers_page` evidence for
 /// that account. That source kind is trusted by signal scoring, so it could be
