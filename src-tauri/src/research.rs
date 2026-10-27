@@ -162,7 +162,7 @@ fn is_public_job_board(host: &str) -> bool {
         .any(|board| host == *board || host.ends_with(&format!(".{board}")))
 }
 
-fn extract_facts(account: &Account, page: FetchResult) -> Vec<ResearchFact> {
+pub(crate) fn extract_facts(account: &Account, page: FetchResult) -> Vec<ResearchFact> {
     let mut facts = vec![extract_fact(account, page.clone())];
     let groups: [(&str, &str, &[&str]); 5] = [
         (
