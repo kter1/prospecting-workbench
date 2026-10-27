@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::models::*;
+use crate::safety::FetchResult;
 
 type SearchRunDbRow = (
     String,
@@ -58,6 +59,8 @@ pub fn open(path: &Path) -> AppResult<Connection> {
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.execute_batch(include_str!("../migrations/001_init.sql"))?;
     connection.execute_batch(include_str!("../migrations/002_prompt_first.sql"))?;
+    connection.execute_batch(include_str!("../migrations/003_page_cache.sql"))?;
+    purge_page_cache(&connection)?;
     let has_quality_flags = {
         let mut statement = connection.prepare("PRAGMA table_info(evidence)")?;
         let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -1983,6 +1986,99 @@ pub fn cached_discoveries(
     .transpose()
 }
 
+/// How long a cached page is reused instead of re-fetched.
+const PAGE_REUSE_HOURS: i64 = 24;
+/// How long a cached page is kept at all.
+const PAGE_RETENTION_DAYS: i64 = 7;
+
+pub fn cached_page(
+    connection: &Connection,
+    account_id: &str,
+    url: &str,
+) -> AppResult<Option<FetchResult>> {
+    let row = connection
+        .query_row(
+            "SELECT final_url,title,text,links_json,etag,modified_at,fetched_at FROM page_cache WHERE account_id=?1 AND url=?2",
+            params![account_id, url],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((final_url, title, text, links_json, etag, modified_at, fetched_at)) = row else {
+        return Ok(None);
+    };
+    let fresh = chrono::DateTime::parse_from_rfc3339(&fetched_at).is_ok_and(|fetched| {
+        Utc::now()
+            .signed_duration_since(fetched.with_timezone(&Utc))
+            .num_hours()
+            < PAGE_REUSE_HOURS
+    });
+    let Ok(final_url) = url::Url::parse(&final_url) else {
+        return Ok(None);
+    };
+    if !fresh {
+        return Ok(None);
+    }
+    let links = serde_json::from_str::<Vec<String>>(&links_json)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|link| url::Url::parse(link).ok())
+        .collect();
+    Ok(Some(FetchResult {
+        final_url,
+        title,
+        text,
+        links,
+        etag,
+        modified_at,
+    }))
+}
+
+pub fn store_page(
+    connection: &Connection,
+    account_id: &str,
+    url: &str,
+    page: &FetchResult,
+) -> AppResult<()> {
+    let links = page.links.iter().map(url::Url::as_str).collect::<Vec<_>>();
+    connection.execute(
+        "INSERT INTO page_cache(account_id,url,final_url,title,text,links_json,etag,modified_at,fetched_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(account_id,url) DO UPDATE SET final_url=excluded.final_url,title=excluded.title,text=excluded.text,
+           links_json=excluded.links_json,etag=excluded.etag,modified_at=excluded.modified_at,fetched_at=excluded.fetched_at",
+        params![
+            account_id,
+            url,
+            page.final_url.as_str(),
+            page.title,
+            page.text,
+            serde_json::to_string(&links)?,
+            page.etag,
+            page.modified_at,
+            now()
+        ],
+    )?;
+    Ok(())
+}
+
+fn purge_page_cache(connection: &Connection) -> AppResult<()> {
+    let cutoff = (Utc::now() - chrono::Duration::days(PAGE_RETENTION_DAYS)).to_rfc3339();
+    connection.execute(
+        "DELETE FROM page_cache WHERE fetched_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(())
+}
+
 pub fn set_source_backoff(
     connection: &Connection,
     source: &str,
@@ -2393,6 +2489,7 @@ pub fn clear_prospects(connection: &Connection) -> AppResult<()> {
          DELETE FROM signals;
          DELETE FROM evidence;
          DELETE FROM people;
+         DELETE FROM page_cache;
          DELETE FROM accounts;",
     )?;
     Ok(())
@@ -2402,7 +2499,7 @@ pub fn delete_all(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
         "DELETE FROM search_run_accounts; DELETE FROM search_runs; DELETE FROM search_briefs; DELETE FROM source_identities; DELETE FROM discovery_cache; DELETE FROM source_backoff; DELETE FROM offer_profile;
          DELETE FROM outcomes; DELETE FROM suppressions; DELETE FROM jobs; DELETE FROM draft_artifacts; DELETE FROM packages;
-         DELETE FROM contacts; DELETE FROM signals; DELETE FROM evidence; DELETE FROM people; DELETE FROM accounts;
+         DELETE FROM contacts; DELETE FROM signals; DELETE FROM evidence; DELETE FROM people; DELETE FROM page_cache; DELETE FROM accounts;
          DELETE FROM sales_play; DELETE FROM settings;",
     )?;
     Ok(())
@@ -3098,5 +3195,45 @@ mod tests {
         restore_json(&mut connection, &export.to_string()).unwrap();
         assert!(list_accounts(&connection).unwrap().is_empty());
         assert_eq!(CONTRACT_VERSION, 3);
+    }
+
+    #[test]
+    fn cached_pages_are_reused_for_a_day_and_purged_with_their_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = open(&directory.path().join("cache.sqlite3")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO accounts(id,name,status,created_at,updated_at) VALUES('a','Acme','new',?1,?1)",
+                params![now()],
+            )
+            .unwrap();
+        let page = FetchResult {
+            final_url: Url::parse("https://acme.example/").unwrap(),
+            title: "Acme".into(),
+            text: "Acme provides plumbing.".into(),
+            links: vec![Url::parse("https://acme.example/about").unwrap()],
+            etag: None,
+            modified_at: None,
+        };
+        store_page(&connection, "a", "https://acme.example/", &page).unwrap();
+        let cached = cached_page(&connection, "a", "https://acme.example/")
+            .unwrap()
+            .expect("fresh page is reused");
+        assert_eq!(cached.text, page.text);
+        assert_eq!(cached.links, page.links);
+
+        let stale = (Utc::now() - Duration::hours(30)).to_rfc3339();
+        connection
+            .execute("UPDATE page_cache SET fetched_at=?1", params![stale])
+            .unwrap();
+        assert!(cached_page(&connection, "a", "https://acme.example/")
+            .unwrap()
+            .is_none());
+
+        connection.execute("DELETE FROM accounts", []).unwrap();
+        let remaining: i64 = connection
+            .query_row("SELECT count(*) FROM page_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

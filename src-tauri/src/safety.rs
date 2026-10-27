@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::sync::LazyLock;
 
 use regex::Regex;
 use reqwest::{header, Client, StatusCode};
@@ -224,9 +225,15 @@ pub async fn fetch_public(client: &Client, initial: Url) -> AppResult<FetchResul
 }
 
 pub fn sanitize_document(raw: &str, base: &Url) -> (String, String, Vec<Url>) {
-    let comments = Regex::new(r"(?is)<!--.*?-->").unwrap();
-    let active = Regex::new(r"(?is)<(?:script|style|noscript|svg|canvas|iframe|object|embed|form|template|nav|footer|aside)[^>]*>.*?</(?:script|style|noscript|svg|canvas|iframe|object|embed|form|template|nav|footer|aside)\s*>").unwrap();
-    let metadata = Regex::new(r"(?is)<(meta|link|base|input|button)[^>]*>").unwrap();
+    // Compiled once: this runs for every page fetched, and compiling the
+    // active-content pattern cost more than applying it.
+    static COMMENTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<!--.*?-->").unwrap());
+    static ACTIVE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<(?:script|style|noscript|svg|canvas|iframe|object|embed|form|template|nav|footer|aside)[^>]*>.*?</(?:script|style|noscript|svg|canvas|iframe|object|embed|form|template|nav|footer|aside)\s*>").unwrap()
+    });
+    static METADATA: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<(meta|link|base|input|button)[^>]*>").unwrap());
+    let (comments, active, metadata) = (&*COMMENTS, &*ACTIVE, &*METADATA);
     let cleaned = metadata
         .replace_all(
             &active.replace_all(&comments.replace_all(raw, " "), " "),
