@@ -141,6 +141,17 @@ pub fn match_packs(query: &str) -> Vec<&'static Pack> {
     scored.into_iter().map(|(_, pack)| pack).collect()
 }
 
+/// Rules used when research runs without a search brief: the phone and intake
+/// pack, which was the crawler's fixed behaviour before rules became editable.
+pub fn default_focus() -> Vec<QualificationRule> {
+    PACKS[0]
+        .rules
+        .iter()
+        .filter_map(|id| template(id))
+        .map(|template| rule_from_template(template, "pack"))
+        .collect()
+}
+
 /// Words that say nothing about a particular business on their own.
 const GENERIC_TERMS: &[&str] = &[
     "service",

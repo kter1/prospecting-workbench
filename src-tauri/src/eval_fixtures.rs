@@ -76,8 +76,12 @@ pub fn package_for(site: &Site, brief: &SearchBrief) -> ProspectPackage {
             etag: None,
             modified_at: None,
         };
-        facts.extend(extract_facts(&account, page));
-        let _ = brief;
+        facts.extend(extract_facts(
+            &account,
+            page,
+            &brief.positive_signals,
+            &brief.target_personas,
+        ));
     }
     let mut evidence = vec![Evidence {
         id: format!("{}-record", account.id),
@@ -444,5 +448,53 @@ mod tests {
                 result.precision, result.recall, result.qualified
             );
         }
+    }
+
+    /// The floor this corpus must not fall below. Precision is the promise:
+    /// nothing a person would not want may qualify. Recall may only miss a
+    /// site that lacks a contact route, which stays a near match by design.
+    #[tokio::test]
+    async fn relevance_floor() {
+        for case in CASES {
+            let brief = brief_for(case).await;
+            let result = evaluate(case, &brief, false);
+            assert_eq!(
+                result.precision, 1.0,
+                "{}: {:?}",
+                case.name, result.qualified
+            );
+            assert!(
+                result.recall >= 0.66,
+                "{}: recall {}",
+                case.name,
+                result.recall
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_independent_signals_and_a_contact_qualify_one_does_not() {
+        let case = &CASES[0];
+        let brief = brief_for(case).await;
+        let mut site = Site {
+            name: "Calibration Cafe",
+            location: "Austin metro, Texas, United States",
+            record: OSM_RESTAURANT,
+            relevant: true,
+            pages: &[(
+                "/",
+                "Calibration Cafe",
+                "Now hiring line cooks for the morning crew.\nEmail hello@calibrationcafe.example",
+            )],
+        };
+        let one = assess_for_search(&package_for(&site, &brief), &brief);
+        assert_eq!(one.state, "needs_review", "{:?}", one.features);
+        site.pages = &[(
+            "/",
+            "Calibration Cafe",
+            "Now hiring line cooks for the morning crew.\nFlexible scheduling and weekly pay for every team member.\nEmail hello@calibrationcafe.example",
+        )];
+        let two = assess_for_search(&package_for(&site, &brief), &brief);
+        assert_eq!(two.state, "qualified", "{:?}", two.features);
     }
 }

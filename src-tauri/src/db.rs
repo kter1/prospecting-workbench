@@ -1490,6 +1490,24 @@ pub fn running_search_run_ids(connection: &Connection) -> AppResult<Vec<String>>
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// The brief of the most recent search that discovered this account.
+pub fn latest_brief_for_account(
+    connection: &Connection,
+    account_id: &str,
+) -> AppResult<Option<SearchBrief>> {
+    let brief_id: Option<String> = connection
+        .query_row(
+            "SELECT r.brief_id FROM search_run_accounts a JOIN search_runs r ON r.id=a.search_run_id
+             WHERE a.account_id=?1 AND r.brief_id IS NOT NULL ORDER BY r.started_at DESC LIMIT 1",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    brief_id
+        .map(|id| get_search_brief(connection, &id))
+        .transpose()
+}
+
 pub fn get_search_run(connection: &Connection, run_id: &str) -> AppResult<SearchRun> {
     let base: Option<SearchRunDbRow> = connection
         .query_row(

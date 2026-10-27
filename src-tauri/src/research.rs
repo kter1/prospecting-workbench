@@ -9,7 +9,9 @@ use url::Url;
 
 use crate::db;
 use crate::error::{AppError, AppResult};
-use crate::models::Account;
+use crate::matcher::{self, Text};
+use crate::models::{Account, QualificationRule};
+use crate::qualification::matches_keyword;
 use crate::safety::{fetch_public, robots_allows, FetchResult};
 
 #[derive(Debug, Clone)]
@@ -68,12 +70,36 @@ impl PageCache for NoCache {
     fn store_page(&self, _: &str, _: &Url, _: &FetchResult) {}
 }
 
+/// Path fragments of pages that usually carry evidence about a business.
+const PAGE_SLUGS: &[&str] = &[
+    "about",
+    "contact",
+    "team",
+    "leader",
+    "career",
+    "jobs",
+    "news",
+    "press",
+    "blog",
+    "services",
+    "locations",
+    "pricing",
+    "menu",
+    "solutions",
+    "patients",
+    "order",
+];
+
 /// How long a robots file may take before it is treated as absent.
 const ROBOTS_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct Crawl<'a> {
     pub fetcher: &'a dyn Fetcher,
     pub cache: &'a dyn PageCache,
+    /// Rules whose supporting lines become evidence.
+    pub focus: &'a [QualificationRule],
+    /// Roles whose mention on a people page becomes evidence.
+    pub personas: &'a [String],
     pub page_budget: usize,
     /// No new fetch starts after this. Facts gathered before it are kept.
     pub deadline: Instant,
@@ -148,28 +174,48 @@ impl Crawl<'_> {
             .unwrap_or_default()
             .trim_start_matches("www.");
         if account.domain.is_some() {
-            // Prefer links the company actually publishes. Guessed paths are
-            // fallbacks, otherwise a site with many 404s can make one candidate
-            // take minutes.
-            for link in &homepage.links {
-                let host = link
-                    .host_str()
-                    .unwrap_or_default()
-                    .trim_start_matches("www.");
-                let lower = link.path().to_ascii_lowercase();
-                let is_public_job_board = is_public_job_board(host);
-                if (host == root_host
-                    && [
-                        "about", "contact", "team", "leader", "career", "jobs", "news", "press",
-                        "blog",
-                    ]
-                    .iter()
-                    .any(|part| lower.contains(part)))
-                    || is_public_job_board
-                {
-                    urls.push(link.clone());
-                }
-            }
+            // Prefer links the company actually publishes, ranked by how likely
+            // they are to hold evidence for the approved rules. Guessed paths
+            // are fallbacks, otherwise a site with many 404s can make one
+            // candidate take minutes.
+            let focus_words = self
+                .focus
+                .iter()
+                .flat_map(|rule| rule.keywords.iter())
+                .flat_map(|keyword| {
+                    keyword
+                        .split(|character: char| !character.is_ascii_alphanumeric())
+                        .filter(|word| word.len() >= 4)
+                        .map(matcher::stem)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<HashSet<_>>();
+            let mut ranked = homepage
+                .links
+                .iter()
+                .filter_map(|link| {
+                    let host = link
+                        .host_str()
+                        .unwrap_or_default()
+                        .trim_start_matches("www.");
+                    if is_public_job_board(host) {
+                        return Some((3, link));
+                    }
+                    if host != root_host {
+                        return None;
+                    }
+                    let path = link.path().to_ascii_lowercase();
+                    let slug = PAGE_SLUGS.iter().any(|part| path.contains(part));
+                    let relevance = path
+                        .split(|character: char| !character.is_ascii_alphanumeric())
+                        .filter(|word| focus_words.contains(&matcher::stem(word)))
+                        .count();
+                    (slug || relevance > 0).then_some((usize::from(slug) + relevance * 2, link))
+                })
+                .collect::<Vec<_>>();
+            // Stable: equally relevant links keep the order the site lists them.
+            ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            urls.extend(ranked.into_iter().map(|(_, link)| link.clone()));
             for path in ["/contact", "/about", "/careers", "/news"] {
                 if let Ok(url) = root.join(path) {
                     urls.push(url);
@@ -225,7 +271,7 @@ impl Crawl<'_> {
             if page.text.trim().is_empty() {
                 continue;
             }
-            results.extend(extract_facts(account, page));
+            results.extend(extract_facts(account, page, self.focus, self.personas));
         }
         if results.is_empty() {
             return Err(AppError::Message(
@@ -252,81 +298,127 @@ fn is_public_job_board(host: &str) -> bool {
         .any(|board| host == *board || host.ends_with(&format!(".{board}")))
 }
 
-pub(crate) fn extract_facts(account: &Account, page: FetchResult) -> Vec<ResearchFact> {
+/// Facts from one page: the page itself, then one quoted line per approved rule
+/// the page supports, and one per persona it names.
+///
+/// The line-level excerpts are what scoring credits. They are chosen with the
+/// same matcher the scorer uses, from the whole page text rather than its
+/// first 500 characters, so a rule can only be credited for a line that
+/// actually affirms it.
+pub(crate) fn extract_facts(
+    account: &Account,
+    page: FetchResult,
+    focus: &[QualificationRule],
+    personas: &[String],
+) -> Vec<ResearchFact> {
+    let lines = page
+        .text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.len() >= 12)
+        .map(|line| (line, Text::new(line)))
+        .collect::<Vec<_>>();
     let mut facts = vec![extract_fact(account, page.clone())];
-    let groups: [(&str, &str, &[&str]); 5] = [
-        (
-            "workflow_after_hours",
-            "After-hours service evidence",
-            &["24/7", "24 hour", "after hours", "emergency service"],
-        ),
-        (
-            "workflow_call_first",
-            "Phone-first intake evidence",
-            &["call now", "call us", "speak with", "phone consultation"],
-        ),
-        (
-            "workflow_appointment",
-            "Appointment or consultation evidence",
-            &[
-                "schedule an appointment",
-                "book by phone",
-                "consultation",
-                "request service",
-            ],
-        ),
-        (
-            "workflow_hiring",
-            "Intake or dispatch hiring evidence",
-            &[
-                "intake specialist",
-                "dispatcher",
-                "receptionist",
-                "customer service representative",
-            ],
-        ),
-        (
-            "workflow_locations",
-            "Multiple-location evidence",
-            &["our locations", "service areas", "areas we serve"],
-        ),
-    ];
-    for (source_kind, title, keywords) in groups {
-        if let Some(excerpt) = focused_excerpt(&page.text, keywords) {
-            facts.push(ResearchFact {
-                source_url: page.final_url.to_string(),
-                source_kind: source_kind.into(),
-                title: title.into(),
-                excerpt: excerpt.clone(),
-                confidence: "high".into(),
-                etag: page.etag.clone(),
-                modified_at: page.modified_at.clone(),
-                contacts: Vec::new(),
-                signals: vec![(
-                    if source_kind == "workflow_hiring" {
-                        "hiring"
-                    } else {
-                        "other"
-                    }
-                    .into(),
-                    excerpt,
-                    "high".into(),
-                )],
-            });
+    let line_fact =
+        |source_kind: &str, title: String, excerpt: String, signal: &str| ResearchFact {
+            source_url: page.final_url.to_string(),
+            source_kind: source_kind.into(),
+            title,
+            excerpt: excerpt.clone(),
+            confidence: "high".into(),
+            etag: page.etag.clone(),
+            modified_at: page.modified_at.clone(),
+            contacts: Vec::new(),
+            signals: if signal.is_empty() {
+                Vec::new()
+            } else {
+                vec![(signal.into(), excerpt, "high".into())]
+            },
+        };
+    // Each rule takes the first supporting line no earlier rule claimed, so a
+    // page with distinct evidence for two rules yields two distinct quotes
+    // rather than one line credited once.
+    let mut claimed = HashSet::new();
+    for rule in focus {
+        let supporting = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, text))| {
+                rule.keywords
+                    .iter()
+                    .any(|keyword| matches_keyword(text, keyword))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let Some(index) = supporting
+            .iter()
+            .find(|index| !claimed.contains(*index))
+            .or(supporting.first())
+            .copied()
+        else {
+            continue;
+        };
+        claimed.insert(index);
+        facts.push(line_fact(
+            "rule_excerpt",
+            rule.label.clone(),
+            excerpt_around(&lines, index),
+            if rule.id.contains("hiring") {
+                "hiring"
+            } else {
+                "other"
+            },
+        ));
+    }
+    if is_people_page(&page.final_url) {
+        // A persona inside the company's own name ("Westside Talent Partners")
+        // cannot be told apart from a person holding that role.
+        let name = Text::new(&account.name);
+        for persona in personas
+            .iter()
+            .filter(|value| !value.trim().is_empty() && !name.mentions(value))
+        {
+            if let Some(index) = lines.iter().position(|(_, text)| text.mentions(persona)) {
+                facts.push(line_fact(
+                    "persona_excerpt",
+                    format!("Names the role: {}", persona.trim()),
+                    excerpt_around(&lines, index),
+                    "",
+                ));
+            }
         }
     }
     facts
 }
 
-fn focused_excerpt(text: &str, keywords: &[&str]) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| line.len() >= 20)
-        .find(|line| {
-            let lower = line.to_ascii_lowercase();
-            keywords.iter().any(|keyword| lower.contains(keyword))
-        })
-        .map(|line| line.chars().take(500).collect())
+/// The matched line, with the following line appended when the match alone is
+/// too short to read as evidence.
+fn excerpt_around(lines: &[(&str, Text)], index: usize) -> String {
+    let mut excerpt = lines[index].0.to_string();
+    if excerpt.chars().count() < 48 {
+        if let Some((next, _)) = lines.get(index + 1) {
+            excerpt.push(' ');
+            excerpt.push_str(next);
+        }
+    }
+    excerpt.chars().take(500).collect()
+}
+
+/// Pages where a business introduces its people.
+fn is_people_page(url: &Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+    path == "/"
+        || [
+            "about",
+            "team",
+            "leader",
+            "staff",
+            "people",
+            "our-story",
+            "who-we-are",
+        ]
+        .iter()
+        .any(|part| path.contains(part))
 }
 
 fn extract_fact(account: &Account, page: FetchResult) -> ResearchFact {
@@ -623,17 +715,65 @@ mod tests {
             etag: None,
             modified_at: None,
         };
-        let facts = extract_facts(&account(), page);
+        let facts = extract_facts(
+            &account(),
+            page,
+            &crate::signals::default_focus(),
+            &["Owner".into()],
+        );
+        let excerpt_for = |label: &str| {
+            facts
+                .iter()
+                .find(|item| item.source_kind == "rule_excerpt" && item.title == label)
+                .map(|item| item.excerpt.clone())
+        };
+        assert_eq!(
+            excerpt_for("After-hours or emergency service").as_deref(),
+            Some("Call now for 24 hour emergency plumbing service.")
+        );
+        assert!(excerpt_for("Phone-first customer intake").is_some());
+        let hiring = facts
+            .iter()
+            .find(|item| item.title == "Intake, dispatch, or receptionist hiring")
+            .expect("the dispatcher line is hiring evidence");
+        assert!(hiring.excerpt.contains("dispatcher"));
+        assert_eq!(hiring.signals[0].0, "hiring");
+        // A services page is not a people page, so no persona evidence.
         assert!(facts
             .iter()
-            .any(|item| item.source_kind == "workflow_after_hours"));
-        assert!(facts
-            .iter()
-            .any(|item| item.source_kind == "workflow_call_first"));
-        assert!(facts
-            .iter()
-            .any(|item| item.source_kind == "workflow_hiring"));
+            .all(|item| item.source_kind != "persona_excerpt"));
         assert!(facts.iter().all(|item| item.excerpt.chars().count() <= 500));
+    }
+
+    #[test]
+    fn rule_evidence_comes_from_the_whole_page_and_respects_negation() {
+        let filler =
+            "Family recipes, fresh ingredients and a warm room every single day.\n".repeat(12);
+        let page = FetchResult {
+            final_url: Url::parse("https://acme.example/about").unwrap(),
+            title: "About".into(),
+            text: format!(
+                "{filler}We are not hiring at this time.\nMeet the owner, Maria Lopez, who opened Acme in 1998.\nNow hiring servers and line cooks for weekend shifts."
+            ),
+            links: vec![],
+            etag: None,
+            modified_at: None,
+        };
+        let rule = crate::signals::rule_from_template(
+            crate::signals::template("hourly_hiring").unwrap(),
+            "pack",
+        );
+        let facts = extract_facts(&account(), page, &[rule], &["Owner".into()]);
+        let hiring = facts
+            .iter()
+            .find(|item| item.source_kind == "rule_excerpt")
+            .expect("a line far past the first 500 characters is still found");
+        assert!(hiring.excerpt.starts_with("Now hiring servers"));
+        let persona = facts
+            .iter()
+            .find(|item| item.source_kind == "persona_excerpt")
+            .expect("an about page naming the owner is persona evidence");
+        assert!(persona.excerpt.contains("Maria Lopez"));
     }
 
     mod crawl {
@@ -727,6 +867,8 @@ mod tests {
             let facts = Crawl {
                 fetcher: &fixture,
                 cache: &NoCache,
+                focus: &[],
+                personas: &[],
                 page_budget: 3,
                 deadline: Instant::now() + Duration::from_millis(300),
             }
@@ -751,6 +893,8 @@ mod tests {
             let crawl = Crawl {
                 fetcher: &fixture,
                 cache: &cache,
+                focus: &[],
+                personas: &[],
                 page_budget: 1,
                 deadline: Instant::now() + Duration::from_secs(5),
             };
@@ -774,6 +918,8 @@ mod tests {
             let result = Crawl {
                 fetcher: &fixture,
                 cache: &NoCache,
+                focus: &[],
+                personas: &[],
                 page_budget: 3,
                 deadline: Instant::now() + Duration::from_secs(5),
             }
@@ -793,6 +939,8 @@ mod tests {
             Crawl {
                 fetcher: &fixture,
                 cache: &NoCache,
+                focus: &[],
+                personas: &[],
                 page_budget: 1,
                 deadline: Instant::now() + Duration::from_secs(6),
             }

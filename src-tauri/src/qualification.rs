@@ -157,9 +157,21 @@ pub fn assess_for_search(package: &ProspectPackage, brief: &SearchBrief) -> Sear
                 ),
             });
         }
-        let evidence_ids = matched
+        // The rule consumes one sentence, preferring the line the crawler
+        // extracted for this very rule. Consuming every matching sentence
+        // starved later rules: a line that mentions "literary department"
+        // and "submissions" must still be available to the submissions rule.
+        let mut available = matched
             .into_iter()
-            .filter(|item| awarded_excerpts.insert(matcher::normalized(&item.excerpt)))
+            .filter(|item| !awarded_excerpts.contains(&matcher::normalized(&item.excerpt)))
+            .collect::<Vec<_>>();
+        available
+            .sort_by_key(|item| !(item.source_kind == "rule_excerpt" && item.title == rule.label));
+        if let Some(first) = available.first() {
+            awarded_excerpts.insert(matcher::normalized(&first.excerpt));
+        }
+        let evidence_ids = available
+            .into_iter()
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         if !evidence_ids.is_empty() {
@@ -326,6 +338,20 @@ pub fn assess_for_play(package: &ProspectPackage, play: &SalesPlay) -> FitAssess
     }
 }
 
+/// Evidence rows that quote a whole crawled page's opening text.
+const PAGE_LEVEL_KINDS: &[&str] = &[
+    "company_page",
+    "contact_page",
+    "careers_page",
+    "company_news",
+    "leadership_page",
+];
+
+/// Rows that quote one line chosen for a rule.
+fn is_line_level(source_kind: &str) -> bool {
+    source_kind == "rule_excerpt" || source_kind.starts_with("workflow_")
+}
+
 /// Evidence kinds whose title the application wrote rather than the page.
 ///
 /// Matching those titles let a fact satisfy its own rule: an excerpt titled
@@ -380,13 +406,27 @@ fn signal_matches<'a>(
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| value.len() >= 3)
         .collect::<Vec<_>>();
+    // A page yields one row for the page and one per line that supports a
+    // rule. Crediting both would let one sentence count twice, once inside the
+    // page excerpt and once on its own, so a page row is only eligible for a
+    // page that produced no line-level evidence (older research, or a page
+    // whose title alone carries the signal).
+    let line_level_pages = package
+        .evidence
+        .iter()
+        .filter(|item| is_line_level(&item.source_kind))
+        .map(|item| item.source_url.as_str())
+        .collect::<HashSet<_>>();
     package
         .evidence
         .iter()
         .zip(texts)
         .filter(|(item, text)| {
-            let trusted_kind =
-                !item.source_kind.ends_with("_record") && item.source_kind != "user_import";
+            let trusted_kind = !item.source_kind.ends_with("_record")
+                && item.source_kind != "user_import"
+                && item.source_kind != "persona_excerpt"
+                && (!PAGE_LEVEL_KINDS.contains(&item.source_kind.as_str())
+                    || !line_level_pages.contains(item.source_url.as_str()));
             // Only a contradiction disqualifies evidence from scoring. The
             // `incomplete` flag fires on any excerpt under 48 characters, which
             // silently discarded short but perfectly valid workflow evidence
@@ -549,10 +589,22 @@ fn persona_score(package: &ProspectPackage, personas: &[String]) -> i64 {
             })
     }) {
         100
-    } else if package.evidence.iter().any(|item| {
-        let excerpt = Text::new(&item.excerpt);
-        personas.iter().any(|persona| excerpt.mentions(persona))
-    }) {
+    } else if package
+        .evidence
+        .iter()
+        // Only pages that introduce people. Any excerpt used to count, so a
+        // company named "... Partners" matched the persona "Partner".
+        .filter(|item| {
+            matches!(
+                item.source_kind.as_str(),
+                "persona_excerpt" | "leadership_page"
+            )
+        })
+        .any(|item| {
+            let excerpt = Text::new(&item.excerpt);
+            personas.iter().any(|persona| excerpt.mentions(persona))
+        })
+    {
         65
     } else {
         0
@@ -948,6 +1000,12 @@ mod tests {
             "Trusted by homeowners across Austin for twenty years.".into();
         assert_eq!(persona_score(&package, &["Owner".into()]), 0);
         package.evidence[0].excerpt = "Meet the owner, Maria Lopez, a master plumber.".into();
+        assert_eq!(
+            persona_score(&package, &["Owner".into()]),
+            0,
+            "a general company page is not people evidence"
+        );
+        package.evidence[0].source_kind = "persona_excerpt".into();
         assert_eq!(persona_score(&package, &["Owner".into()]), 65);
         package.people.push(crate::models::Person {
             id: "p".into(),
