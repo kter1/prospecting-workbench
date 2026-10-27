@@ -723,12 +723,33 @@ async fn execute_generation_job(state: &AppState, app: &AppHandle, job_id: &str)
     Ok(())
 }
 
+/// Full research outside a search. It looks for evidence of the rules from the
+/// most recent search that found this account, or the phone-intake defaults
+/// when no search did.
 async fn execute_research(state: &AppState, account_id: &str, job_id: &str) -> AppResult<()> {
-    execute_research_with_depth(state, account_id, job_id, false).await
+    let brief = db::latest_brief_for_account(&*state.connection()?, account_id)?;
+    let (focus, personas) = match brief {
+        Some(brief) => (brief.positive_signals, brief.target_personas),
+        None => (signals::default_focus(), Vec::new()),
+    };
+    execute_research_with_depth(state, account_id, job_id, false, &focus, &personas).await
 }
 
-async fn execute_quick_research(state: &AppState, account_id: &str, job_id: &str) -> AppResult<()> {
-    execute_research_with_depth(state, account_id, job_id, true).await
+async fn execute_quick_research(
+    state: &AppState,
+    account_id: &str,
+    job_id: &str,
+    brief: &SearchBrief,
+) -> AppResult<()> {
+    execute_research_with_depth(
+        state,
+        account_id,
+        job_id,
+        true,
+        &brief.positive_signals,
+        &brief.target_personas,
+    )
+    .await
 }
 
 async fn execute_research_with_depth(
@@ -736,6 +757,8 @@ async fn execute_research_with_depth(
     account_id: &str,
     job_id: &str,
     quick: bool,
+    focus: &[QualificationRule],
+    personas: &[String],
 ) -> AppResult<()> {
     let account = {
         let connection = state.connection()?;
@@ -758,6 +781,8 @@ async fn execute_research_with_depth(
     let mut facts = research::Crawl {
         fetcher: &fetcher,
         cache: state,
+        focus,
+        personas,
         page_budget,
         deadline: Instant::now() + allowance,
     }
@@ -895,7 +920,7 @@ async fn process_search_candidate(
             },
         )?;
         let job_id = create_job(state, Some(account_id), "quick_crawl")?;
-        execute_quick_research(state, account_id, &job_id)
+        execute_quick_research(state, account_id, &job_id, brief)
             .await
             .err()
             .map(|error| {
