@@ -13,9 +13,10 @@ mod research;
 mod safety;
 mod wikidata;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::redirect::Policy;
 use reqwest::Client;
@@ -31,6 +32,39 @@ struct AppState {
     database: Arc<Mutex<Connection>>,
     client: Client,
     app_data_dir: PathBuf,
+    /// Parsed robots files by host, kept in memory for a day. Robots files are
+    /// tiny and per-host, so a database round trip would cost more than it saves.
+    robots: Arc<Mutex<HashMap<String, (Instant, String)>>>,
+}
+
+const ROBOTS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+impl research::PageCache for AppState {
+    fn robots(&self, host: &str) -> Option<String> {
+        let cache = self.robots.lock().ok()?;
+        cache
+            .get(host)
+            .filter(|(stored, _)| stored.elapsed() < ROBOTS_CACHE_TTL)
+            .map(|(_, text)| text.clone())
+    }
+
+    fn store_robots(&self, host: &str, text: &str) {
+        if let Ok(mut cache) = self.robots.lock() {
+            cache.insert(host.to_string(), (Instant::now(), text.to_string()));
+        }
+    }
+
+    fn page(&self, account_id: &str, url: &url::Url) -> Option<safety::FetchResult> {
+        db::cached_page(&*self.connection().ok()?, account_id, url.as_str())
+            .ok()
+            .flatten()
+    }
+
+    fn store_page(&self, account_id: &str, url: &url::Url, page: &safety::FetchResult) {
+        if let Ok(connection) = self.connection() {
+            let _ = db::store_page(&connection, account_id, url.as_str(), page);
+        }
+    }
 }
 
 /// Where search-run progress goes. The desktop app emits it to the window;
@@ -677,20 +711,24 @@ async fn execute_research_with_depth(
         )?;
         db::get_account(&connection, account_id)?
     };
-    let mut facts = if quick {
-        tokio::time::timeout(
-            Duration::from_secs(6),
-            research::crawl_account_quick(&state.client, &account),
-        )
-        .await
-        .map_err(|_| {
-            AppError::Message(
-                "Quick public research exceeded its 6-second per-company budget.".into(),
-            )
-        })??
+    // A deadline rather than a timeout around the whole crawl: a slow site
+    // still yields the pages it served in time, instead of nothing at all.
+    let (page_budget, allowance) = if quick {
+        (3, Duration::from_secs(6))
     } else {
-        research::crawl_account(&state.client, &account).await?
+        (8, Duration::from_secs(60))
     };
+    let fetcher = research::PublicFetcher {
+        client: &state.client,
+    };
+    let mut facts = research::Crawl {
+        fetcher: &fetcher,
+        cache: state,
+        page_budget,
+        deadline: Instant::now() + allowance,
+    }
+    .run(&account)
+    .await?;
     if !quick {
         facts.extend(adapters::refresh_public_signals(&state.client, &account).await);
     }
@@ -1325,112 +1363,110 @@ async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str)
         },
     )?;
 
-    // Research a broad pre-ranked pool in bounded batches. The requested count
-    // is the maximum number of strong matches, never a pre-research truncation.
-    // These are all distinct hosts; per-site politeness comes from the delay
-    // inside crawl_account_with_page_budget, not from this width.
+    // Research a broad pre-ranked pool with a constant number of candidates in
+    // flight. The requested count is the maximum number of strong matches,
+    // never a pre-research truncation. Fixed batches used to wait for their
+    // slowest site before starting the next, idling most workers at each
+    // boundary. These are all distinct hosts; per-site politeness comes from
+    // the delay inside the crawl, not from this width.
     const PARALLEL_RESEARCH: usize = 12;
     let budget = search_budget(brief.result_limit);
     let started = std::time::Instant::now();
     let mut completed = 0_i64;
     let mut stopped_by_budget = false;
-    let batch_size = brief.result_limit.max(1) as usize;
-    let mut confirmation_due = false;
-    for batch in candidate_ids.chunks(batch_size) {
-        if started.elapsed() >= budget {
-            stopped_by_budget = true;
+    let finalize_every = brief.result_limit.max(1);
+    let mut since_finalize = 0_i64;
+    // Once the requested number of strong matches exists, research one more
+    // request-sized slice to confirm the band, then stop starting new work.
+    let mut confirmation_quota: Option<i64> = None;
+    let mut pending = candidate_ids.iter().cloned();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        while tasks.len() < PARALLEL_RESEARCH && confirmation_quota != Some(0) {
+            let Some(account_id) = pending.next() else {
+                break;
+            };
+            if let Some(quota) = confirmation_quota.as_mut() {
+                *quota -= 1;
+            }
+            let background = state.clone();
+            let task_run_id = run_id.to_string();
+            let task_brief = brief.clone();
+            tasks.spawn(async move {
+                let outcome =
+                    process_search_candidate(&background, &task_run_id, &account_id, &task_brief)
+                        .await;
+                (account_id, outcome)
+            });
+        }
+        if tasks.is_empty() {
             break;
         }
-        let mut pending = batch.iter().cloned();
-        let mut tasks = tokio::task::JoinSet::new();
-        loop {
-            while tasks.len() < PARALLEL_RESEARCH {
-                let Some(account_id) = pending.next() else {
-                    break;
-                };
-                let background = state.clone();
-                let task_run_id = run_id.to_string();
-                let task_brief = brief.clone();
-                tasks.spawn(async move {
-                    let outcome = process_search_candidate(
-                        &background,
-                        &task_run_id,
-                        &account_id,
-                        &task_brief,
-                    )
-                    .await;
-                    (account_id, outcome)
-                });
-            }
-            if tasks.is_empty() {
-                break;
-            }
-            if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
-                tasks.abort_all();
-                return Ok(());
-            }
-            let (account_id, outcome) = tasks
-                .join_next()
-                .await
-                .ok_or_else(|| {
-                    AppError::Message("Search research queue stopped unexpectedly.".into())
-                })?
-                .map_err(|error| {
-                    AppError::Message(format!(
-                        "Search research worker stopped unexpectedly: {error}"
-                    ))
-                })?;
-            if let Err(error) = outcome {
-                let reasons = vec![format!(
-                    "Candidate processing failed: {}",
-                    error.to_string().chars().take(240).collect::<String>()
-                )];
-                db::update_search_run_account(
-                    &*state.connection()?,
-                    run_id,
-                    &account_id,
-                    db::SearchRunAccountUpdate {
-                        state: "failed",
-                        score: None,
-                        confidence: "low",
-                        rejection_reasons: &reasons,
-                        features: &[],
-                        assessment: None,
-                        rank: None,
-                        result_tier: "excluded",
-                    },
-                )?;
-            }
-            completed += 1;
-            db::set_search_run_progress(&*state.connection()?, run_id, completed, total)?;
-            db::set_search_run_counts(&*state.connection()?, run_id, total, completed)?;
-            publish_search_progress(
-                state,
-                sink,
+        if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
+            tasks.abort_all();
+            return Ok(());
+        }
+        let Some(left) = budget.checked_sub(started.elapsed()) else {
+            stopped_by_budget = true;
+            tasks.abort_all();
+            break;
+        };
+        let Ok(joined) = tokio::time::timeout(left, tasks.join_next()).await else {
+            stopped_by_budget = true;
+            tasks.abort_all();
+            break;
+        };
+        let (account_id, outcome) = joined
+            .ok_or_else(|| AppError::Message("Search research queue stopped unexpectedly.".into()))?
+            .map_err(|error| {
+                AppError::Message(format!(
+                    "Search research worker stopped unexpectedly: {error}"
+                ))
+            })?;
+        if let Err(error) = outcome {
+            let reasons = vec![format!(
+                "Candidate processing failed: {}",
+                error.to_string().chars().take(240).collect::<String>()
+            )];
+            db::update_search_run_account(
+                &*state.connection()?,
                 run_id,
-                40 + (completed * 55 / total.max(1)),
-                &format!("Researched {completed} of {total} discovered candidates"),
+                &account_id,
+                db::SearchRunAccountUpdate {
+                    state: "failed",
+                    score: None,
+                    confidence: "low",
+                    rejection_reasons: &reasons,
+                    features: &[],
+                    assessment: None,
+                    rank: None,
+                    result_tier: "excluded",
+                },
             )?;
-            if started.elapsed() >= budget {
-                stopped_by_budget = true;
-                tasks.abort_all();
-                break;
-            }
         }
-        let (strong, _) = db::finalize_search_ranking(
-            &*state.connection()?,
+        completed += 1;
+        db::set_search_run_progress(&*state.connection()?, run_id, completed, total)?;
+        db::set_search_run_counts(&*state.connection()?, run_id, total, completed)?;
+        publish_search_progress(
+            state,
+            sink,
             run_id,
-            brief.qualification_threshold,
-            brief.quality_band,
-            brief.result_limit,
+            40 + (completed * 55 / total.max(1)),
+            &format!("Researched {completed} of {total} discovered candidates"),
         )?;
-        if confirmation_due {
-            break;
-        }
-        confirmation_due = strong >= brief.result_limit;
-        if started.elapsed() >= budget {
-            stopped_by_budget = true;
-            break;
+        since_finalize += 1;
+        if since_finalize >= finalize_every {
+            since_finalize = 0;
+            let (strong, _) = db::finalize_search_ranking(
+                &*state.connection()?,
+                run_id,
+                brief.qualification_threshold,
+                brief.quality_band,
+                brief.result_limit,
+            )?;
+            if confirmation_quota.is_none() && strong >= brief.result_limit {
+                confirmation_quota = Some(brief.result_limit);
+            }
         }
     }
     if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
@@ -1586,6 +1622,7 @@ pub fn run() {
                 database: Arc::new(Mutex::new(connection)),
                 client,
                 app_data_dir,
+                robots: Arc::default(),
             };
             let background = state.clone();
             let search_background = state.clone();
@@ -1807,6 +1844,7 @@ mod live_eval {
             )),
             client: build_client().unwrap(),
             app_data_dir: directory.path().to_path_buf(),
+            robots: Arc::default(),
         };
         let sink: ProgressSink = Arc::new(|_| {});
         for (query, geography) in BRIEFS {
