@@ -223,6 +223,7 @@ impl Crawl<'_> {
             }
         }
         let mut seen = HashSet::new();
+        let mut detected = HashSet::new();
         let mut results = Vec::new();
         let mut attempted = 0;
         for url in urls {
@@ -267,6 +268,13 @@ impl Crawl<'_> {
             };
             if url == root {
                 attempted += 1;
+            }
+            for id in &page.technologies {
+                if let Some(technology) = crate::technology::find(id) {
+                    if detected.insert(technology.id) {
+                        results.push(technology_fact(technology, &page));
+                    }
+                }
             }
             if page.text.trim().is_empty() {
                 continue;
@@ -389,6 +397,25 @@ pub(crate) fn extract_facts(
         }
     }
     facts
+}
+
+/// Evidence that the business's site runs a known technology.
+fn technology_fact(technology: &crate::technology::Technology, page: &FetchResult) -> ResearchFact {
+    ResearchFact {
+        source_url: page.final_url.to_string(),
+        source_kind: "technology_detected".into(),
+        title: format!("Website technology: {}", technology.name),
+        excerpt: crate::technology::describe(technology, &page.final_url),
+        confidence: "high".into(),
+        etag: page.etag.clone(),
+        modified_at: page.modified_at.clone(),
+        contacts: Vec::new(),
+        signals: vec![(
+            "technical".into(),
+            format!("Uses {} ({})", technology.name, technology.category),
+            "high".into(),
+        )],
+    }
 }
 
 /// The matched line, with the following line appended when the match alone is
@@ -623,7 +650,7 @@ mod tests {
 
     #[test]
     fn keeps_only_same_domain_business_email() {
-        let page = FetchResult { final_url: Url::parse("https://acme.example/contact").unwrap(), title: "Contact".into(), text: "Contact sales@acme.example or personal@gmail.com.\nCall (212) 555-0100 for our business office.".into(), links: vec![], etag: None, modified_at: None };
+        let page = FetchResult { final_url: Url::parse("https://acme.example/contact").unwrap(), title: "Contact".into(), text: "Contact sales@acme.example or personal@gmail.com.\nCall (212) 555-0100 for our business office.".into(), links: vec![], etag: None, modified_at: None, technologies: vec![] };
         let fact = extract_fact(&account(), page);
         assert!(fact
             .contacts
@@ -648,6 +675,7 @@ mod tests {
             links: vec![],
             etag: None,
             modified_at: None,
+            technologies: vec![],
         };
         let fact = extract_fact(&account(), page);
         assert!(!fact
@@ -714,6 +742,7 @@ mod tests {
             links: vec![],
             etag: None,
             modified_at: None,
+            technologies: vec![],
         };
         let facts = extract_facts(
             &account(),
@@ -758,6 +787,7 @@ mod tests {
             links: vec![],
             etag: None,
             modified_at: None,
+            technologies: vec![],
         };
         let rule = crate::signals::rule_from_template(
             crate::signals::template("hourly_hiring").unwrap(),
@@ -818,6 +848,12 @@ mod tests {
                     links: vec![Url::parse("https://acme.example/about").unwrap()],
                     etag: None,
                     modified_at: None,
+                    // Stands in for markup detection, which has its own tests.
+                    technologies: if text.contains("Book with us") {
+                        vec!["calendly".into()]
+                    } else {
+                        vec![]
+                    },
                 })
             }
         }
@@ -877,6 +913,39 @@ mod tests {
             .expect("the homepage arrived in time, so its facts survive");
             assert!(facts.iter().any(|fact| fact.excerpt.contains("emergency")));
             assert!(facts.iter().all(|fact| !fact.source_url.contains("about")));
+        }
+
+        #[tokio::test]
+        async fn detected_technologies_become_one_evidence_row_each() {
+            let fixture = Fixture::new(&[
+                (
+                    "https://acme.example/",
+                    0,
+                    "Book with us for 24/7 plumbing anywhere in town.",
+                ),
+                (
+                    "https://acme.example/about",
+                    0,
+                    "Book with us. About Acme and its long history.",
+                ),
+            ]);
+            let facts = Crawl {
+                fetcher: &fixture,
+                cache: &NoCache,
+                focus: &[],
+                personas: &[],
+                page_budget: 3,
+                deadline: Instant::now() + Duration::from_secs(5),
+            }
+            .run(&site())
+            .await
+            .unwrap();
+            let detected = facts
+                .iter()
+                .filter(|fact| fact.source_kind == "technology_detected")
+                .collect::<Vec<_>>();
+            assert_eq!(detected.len(), 1, "two pages, one technology, one row");
+            assert_eq!(detected[0].title, "Website technology: Calendly");
         }
 
         #[tokio::test]

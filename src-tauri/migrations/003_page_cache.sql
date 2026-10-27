@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS page_cache (
   links_json TEXT NOT NULL DEFAULT '[]',
   etag TEXT,
   modified_at TEXT,
+  technologies_json TEXT NOT NULL DEFAULT '[]',
   fetched_at TEXT NOT NULL,
   PRIMARY KEY(account_id, url)
 );

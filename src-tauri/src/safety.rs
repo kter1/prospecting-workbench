@@ -20,6 +20,9 @@ pub struct FetchResult {
     pub links: Vec<Url>,
     pub etag: Option<String>,
     pub modified_at: Option<String>,
+    /// Ids from `technology::TECHNOLOGIES` found in the raw markup, which the
+    /// sanitized text no longer carries.
+    pub technologies: Vec<String>,
 }
 
 pub fn is_public_ip(ip: IpAddr) -> bool {
@@ -210,6 +213,10 @@ pub async fn fetch_public(client: &Client, initial: Url) -> AppResult<FetchResul
         }
         let raw = String::from_utf8_lossy(&body);
         let (title, text, links) = sanitize_document(&raw, &current);
+        let technologies = crate::technology::detect(&raw, &current)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         return Ok(FetchResult {
             final_url: current,
             title,
@@ -217,6 +224,7 @@ pub async fn fetch_public(client: &Client, initial: Url) -> AppResult<FetchResul
             links,
             etag,
             modified_at,
+            technologies,
         });
     }
     Err(AppError::Message(

@@ -75,6 +75,7 @@ pub fn package_for(site: &Site, brief: &SearchBrief) -> ProspectPackage {
             links: vec![],
             etag: None,
             modified_at: None,
+            technologies: vec![],
         };
         facts.extend(extract_facts(
             &account,

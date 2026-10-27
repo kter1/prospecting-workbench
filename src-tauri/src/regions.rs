@@ -193,6 +193,50 @@ fn nationwide(rotation: usize) -> Vec<BoundedRegion> {
         .collect()
 }
 
+/// Wikidata items for each state: (display name, item id, the item's English
+/// label). The label lets the discovery lane verify at query time that an id
+/// really names the state it is filed under; a mismatch is reported and the
+/// state filter skipped, never trusted.
+#[rustfmt::skip]
+const WIKIDATA_STATES: &[(&str, &str, &str)] = &[
+    ("Alabama", "Q173", "Alabama"), ("Alaska", "Q797", "Alaska"), ("Arizona", "Q816", "Arizona"),
+    ("Arkansas", "Q1612", "Arkansas"), ("California", "Q99", "California"), ("Colorado", "Q1261", "Colorado"),
+    ("Connecticut", "Q779", "Connecticut"), ("Delaware", "Q1393", "Delaware"),
+    ("District of Columbia", "Q61", "Washington, D.C."), ("Florida", "Q812", "Florida"),
+    ("Georgia", "Q1428", "Georgia"), ("Hawaii", "Q782", "Hawaii"), ("Idaho", "Q1221", "Idaho"),
+    ("Illinois", "Q1204", "Illinois"), ("Indiana", "Q1415", "Indiana"), ("Iowa", "Q1546", "Iowa"),
+    ("Kansas", "Q1558", "Kansas"), ("Kentucky", "Q1603", "Kentucky"), ("Louisiana", "Q1588", "Louisiana"),
+    ("Maine", "Q724", "Maine"), ("Maryland", "Q1391", "Maryland"), ("Massachusetts", "Q771", "Massachusetts"),
+    ("Michigan", "Q1166", "Michigan"), ("Minnesota", "Q1527", "Minnesota"), ("Mississippi", "Q1494", "Mississippi"),
+    ("Missouri", "Q1581", "Missouri"), ("Montana", "Q1212", "Montana"), ("Nebraska", "Q1553", "Nebraska"),
+    ("Nevada", "Q1227", "Nevada"), ("New Hampshire", "Q759", "New Hampshire"), ("New Jersey", "Q1408", "New Jersey"),
+    ("New Mexico", "Q1522", "New Mexico"), ("New York", "Q1384", "New York"), ("North Carolina", "Q1454", "North Carolina"),
+    ("North Dakota", "Q1207", "North Dakota"), ("Ohio", "Q1397", "Ohio"), ("Oklahoma", "Q1649", "Oklahoma"),
+    ("Oregon", "Q824", "Oregon"), ("Pennsylvania", "Q1400", "Pennsylvania"), ("Rhode Island", "Q1387", "Rhode Island"),
+    ("South Carolina", "Q1456", "South Carolina"), ("South Dakota", "Q1211", "South Dakota"), ("Tennessee", "Q1509", "Tennessee"),
+    ("Texas", "Q1439", "Texas"), ("Utah", "Q829", "Utah"), ("Vermont", "Q16551", "Vermont"),
+    ("Virginia", "Q1370", "Virginia"), ("Washington", "Q1223", "Washington"), ("West Virginia", "Q1371", "West Virginia"),
+    ("Wisconsin", "Q1537", "Wisconsin"), ("Wyoming", "Q1214", "Wyoming"),
+];
+
+/// A state as the Wikidata lane filters by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WikidataState {
+    pub name: &'static str,
+    pub id: &'static str,
+    pub label: &'static str,
+}
+
+/// The state a geography names, as a Wikidata filter. `None` for nationwide or
+/// unrecognized geographies.
+pub fn wikidata_state(geography: &str) -> Option<WikidataState> {
+    let state = place(geography)?.state;
+    WIKIDATA_STATES
+        .iter()
+        .find(|(name, _, _)| *name == state)
+        .map(|(name, id, label)| WikidataState { name, id, label })
+}
+
 /// Where a piece of text places something: a metro when one is named, and
 /// always the state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +413,18 @@ mod tests {
             Some("West Virginia")
         );
         assert_eq!(place("United States"), None);
+    }
+
+    #[test]
+    fn every_state_has_a_wikidata_filter() {
+        for entry in STATES {
+            let scoped = wikidata_state(entry.display)
+                .unwrap_or_else(|| panic!("{} has no Wikidata id", entry.display));
+            assert_eq!(scoped.name, entry.display);
+            assert!(scoped.id.starts_with('Q'));
+        }
+        assert_eq!(wikidata_state("Austin, TX").map(|s| s.id), Some("Q1439"));
+        assert_eq!(wikidata_state("United States"), None);
         assert!(resolve("Paris, France", 0).is_empty());
     }
 
