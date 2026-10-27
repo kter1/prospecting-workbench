@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const CONTRACT_VERSION: u8 = 3;
 pub const MODEL_TAG: &str = "qwen3.5:9b";
 pub const PROMPT_VERSION: &str = "prospect-package-v1";
-pub const SEARCH_PROMPT_VERSION: &str = "search-brief-v3";
+pub const SEARCH_PROMPT_VERSION: &str = "search-brief-v4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +81,9 @@ pub struct QualificationRule {
     pub keywords: Vec<String>,
     pub points: i64,
     pub hard_gate: bool,
+    /// Where the rule came from: `catalog`, `pack`, `model`, `query` or `user`.
+    #[serde(default)]
+    pub origin: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

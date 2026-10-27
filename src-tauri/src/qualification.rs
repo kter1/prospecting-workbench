@@ -692,6 +692,7 @@ mod tests {
                 keywords: vec!["24 hour".into(), "emergency".into()],
                 points: 100,
                 hard_gate: false,
+                origin: "pack".into(),
             }],
             exclusions: vec![],
             discovery_lanes: vec![],
@@ -764,6 +765,7 @@ mod tests {
                 keywords: vec!["24 hour".into(), "emergency".into()],
                 points: 100,
                 hard_gate: false,
+                origin: "pack".into(),
             }],
             exclusions: vec![],
             discovery_lanes: vec![],
@@ -1018,6 +1020,7 @@ mod tests {
                     keywords: vec![keyword.into()],
                     points: 45,
                     hard_gate: false,
+                    origin: "pack".into(),
                 });
         }
         let result = assess_for_search(&package, &brief);
@@ -1045,6 +1048,7 @@ mod tests {
                 keywords: vec!["24 hour".into()],
                 points: 100,
                 hard_gate: false,
+                origin: "pack".into(),
             });
         assert_eq!(assess_for_search(&package(), &brief).state, "qualified");
         brief
@@ -1056,6 +1060,7 @@ mod tests {
                 keywords: vec!["patient portal".into()],
                 points: 45,
                 hard_gate: true,
+                origin: "pack".into(),
             });
         let result = assess_for_search(&package(), &brief);
         assert_eq!(result.state, "needs_review");

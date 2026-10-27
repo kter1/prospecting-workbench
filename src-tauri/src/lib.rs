@@ -11,6 +11,7 @@ mod qualification;
 mod regions;
 mod research;
 mod safety;
+mod signals;
 mod wikidata;
 
 use std::collections::HashMap;
@@ -187,6 +188,36 @@ async fn interpret_prospecting_query(
     Ok(brief)
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignalSuggestions {
+    rules: Vec<QualificationRule>,
+    message: String,
+}
+
+#[tauri::command]
+async fn suggest_signal_rules(
+    state: State<'_, AppState>,
+    query: String,
+    segment_labels: Vec<String>,
+    existing: Vec<QualificationRule>,
+) -> AppResult<SignalSuggestions> {
+    let query = query.trim().chars().take(5_000).collect::<String>();
+    let segment_labels = segment_labels
+        .into_iter()
+        .take(8)
+        .map(|label| label.chars().take(80).collect())
+        .collect::<Vec<String>>();
+    match ai::propose_signal_rules(&state.client, &query, &segment_labels, &existing).await {
+        Ok((rules, message)) => Ok(SignalSuggestions { rules, message }),
+        // A suggestion failure never blocks a search; the plan already has rules.
+        Err(error) => Ok(SignalSuggestions {
+            rules: Vec::new(),
+            message: format!("The local model could not suggest signals: {error}"),
+        }),
+    }
+}
+
 #[tauri::command]
 async fn start_search_run(
     app: AppHandle,
@@ -202,6 +233,9 @@ async fn start_search_run(
             "This brief has no compliant automatic discovery lane. Use its guided searches or import account seeds.".into(),
         ));
     }
+    // Rules arrive from the plan editor and the local model; neither is
+    // trusted to have bounded them.
+    signals::sanitize_rules(&mut brief.positive_signals);
     brief.approved = true;
     let run = db::create_search_run(&*state.connection()?, &brief)?;
     let background = state.inner().clone();
@@ -1660,6 +1694,7 @@ pub fn run() {
             save_sales_play,
             propose_sales_play,
             interpret_prospecting_query,
+            suggest_signal_rules,
             start_search_run,
             list_search_runs,
             get_search_run,
@@ -1754,6 +1789,7 @@ mod command_policy_tests {
                 keywords: vec!["emergency service".into()],
                 points: 55,
                 hard_gate: false,
+                origin: "pack".into(),
             }],
             exclusions: vec![],
             discovery_lanes: vec![],
