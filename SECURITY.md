@@ -2,7 +2,7 @@
 
 ## Data boundary
 
-Prospecting data is stored only in the local SQLite application database. There is no application server, account system, telemetry, cloud sync, or hosted AI. Exports are written to a local `exports` directory and may contain sensitive sales research; users must protect them accordingly.
+Prospecting data is stored only in the local SQLite application database. There is no application server, account system, telemetry, cloud sync, or hosted inference. Exports are written to a local `exports` directory and may contain sensitive sales research; users must protect them accordingly.
 
 ## Web content boundary
 

@@ -103,7 +103,7 @@ Migration `004_prospect_index.sql`:
 
 Bundle the Census NAICS 2022 code titles and index entries as static data. It is public domain, a few MB, and the source URL and exact file are **verify**.
 
-- **Planner.** The audience clause (`ai::audience_clause`) is matched on whole words against titles and index entries, through the existing `matcher::Text`. That yields NAICS codes from the table, which appear in the plan as editable chips, for example "722511 Full-Service Restaurants ×". You can add a code by searching the table.
+- **Planner.** The audience clause (`local_model::audience_clause`) is matched on whole words against titles and index entries, through the existing `matcher::Text`. That yields NAICS codes from the table, which appear in the plan as editable chips, for example "722511 Full-Service Restaurants ×". You can add a code by searching the table.
 - **Model suggestions.** The model suggests plain phrases that are resolved against the table. A code that is not in the table is impossible.
 - **Crosswalks** are curated static tables, each with tests that every code exists:
   - NAICS to NUCC taxonomy, for 621xxx healthcare;

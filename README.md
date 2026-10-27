@@ -72,7 +72,7 @@ Rust core
   |-- matcher.rs                shared stemmed, negation-aware matcher
   |-- technology.rs             website technology fingerprints
   |-- qualification.rs          fixed-weight scoring, hard gates
-  |-- ai.rs                     Ollama structured output, verification
+  |-- local_model.rs            Ollama structured output, planning, verification
   |-- db.rs                     SQLite, migrations, serialized writes
         |
         v
@@ -98,7 +98,7 @@ Keep the repository outside `~/Documents`, `~/Desktop` and `~/Downloads`. macOS 
 
 ## Scope and limitations
 
-The application does not send email, place calls, guess addresses, scrape LinkedIn or search result pages, use paid databases, collect telemetry, or fall back to hosted AI. Coverage is bounded by what free public sources actually publish, and the app reports that rather than filling gaps with plausible guesses. Outreach material is prepared for a person to review, edit and send, and the operator remains responsible for complying with applicable law.
+The application does not send email, place calls, guess addresses, scrape LinkedIn or search result pages, use paid databases, collect telemetry, or fall back to hosted models. Coverage is bounded by what free public sources actually publish, and the app reports that rather than filling gaps with plausible guesses. Outreach material is prepared for a person to review, edit and send, and the operator remains responsible for complying with applicable law.
 
 ## Project status
 

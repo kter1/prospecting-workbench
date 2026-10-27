@@ -548,7 +548,7 @@ pub struct DashboardSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AiPackageOutput {
+pub struct DraftPackageOutput {
     pub reasons: Vec<CitedReason>,
     pub subject: String,
     pub body: String,

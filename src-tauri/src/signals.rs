@@ -8,7 +8,7 @@
 //!
 //! 1. **Packs** (this module): curated rule sets keyed to the kind of product
 //!    the user describes. Offline and instant.
-//! 2. **Model suggestions** (`ai::propose_signal_rules`): extra rules the local
+//! 2. **Model suggestions** (`local_model::propose_signal_rules`): extra rules the local
 //!    model proposes after the plan renders, sanitized here.
 //! 3. **The user**, who can edit keywords, add rules, mark a rule required, or
 //!    remove one.

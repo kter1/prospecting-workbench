@@ -70,17 +70,17 @@ struct SearchBriefProposal {
 }
 
 #[async_trait]
-pub trait AiProvider {
+pub trait DraftProvider {
     async fn health(&self) -> OllamaHealth;
     async fn compose(
         &self,
         package: &ProspectPackage,
         play: &SalesPlay,
         draft_kind: &str,
-    ) -> AppResult<(AiPackageOutput, String)>;
+    ) -> AppResult<(DraftPackageOutput, String)>;
     async fn verify(
         &self,
-        output: &AiPackageOutput,
+        output: &DraftPackageOutput,
         evidence: &[Evidence],
         play: &SalesPlay,
     ) -> AppResult<(Vec<String>, Vec<ClaimEvidence>)>;
@@ -91,7 +91,7 @@ pub struct OllamaProvider<'a> {
 }
 
 #[async_trait]
-impl AiProvider for OllamaProvider<'_> {
+impl DraftProvider for OllamaProvider<'_> {
     async fn health(&self) -> OllamaHealth {
         ollama_health(self.client).await
     }
@@ -101,7 +101,7 @@ impl AiProvider for OllamaProvider<'_> {
         package: &ProspectPackage,
         play: &SalesPlay,
         draft_kind: &str,
-    ) -> AppResult<(AiPackageOutput, String)> {
+    ) -> AppResult<(DraftPackageOutput, String)> {
         let health = self.health().await;
         if !health.reachable || !health.model_installed {
             return Err(AppError::Message(health.message));
@@ -130,7 +130,7 @@ impl AiProvider for OllamaProvider<'_> {
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         let value = ollama_chat(self.client, messages, package_schema(&evidence_ids)).await?;
-        let output: AiPackageOutput = serde_json::from_value(value)?;
+        let output: DraftPackageOutput = serde_json::from_value(value)?;
         validate_shape(&output)?;
         Ok((
             output,
@@ -142,7 +142,7 @@ impl AiProvider for OllamaProvider<'_> {
 
     async fn verify(
         &self,
-        output: &AiPackageOutput,
+        output: &DraftPackageOutput,
         evidence: &[Evidence],
         play: &SalesPlay,
     ) -> AppResult<(Vec<String>, Vec<ClaimEvidence>)> {
@@ -987,7 +987,7 @@ where
         (output, digest, unsupported, verified_claims)
     } else {
         return Err(AppError::Message(
-            "Unknown AI provider. Hosted fallback is intentionally unavailable.".into(),
+            "Unknown drafting provider. Hosted fallback is intentionally unavailable.".into(),
         ));
     };
     progress(90, "Claims verified")?;
@@ -1082,7 +1082,7 @@ where
     Ok((assessment, draft, output.call_brief))
 }
 
-fn validate_shape(output: &AiPackageOutput) -> AppResult<()> {
+fn validate_shape(output: &DraftPackageOutput) -> AppResult<()> {
     if output.subject.trim().is_empty()
         || output.body.trim().is_empty()
         || output.call_brief.hypotheses.len() != 2
@@ -1095,7 +1095,7 @@ fn validate_shape(output: &AiPackageOutput) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_citations(output: &AiPackageOutput, valid_ids: &HashSet<&str>) -> AppResult<()> {
+fn validate_citations(output: &DraftPackageOutput, valid_ids: &HashSet<&str>) -> AppResult<()> {
     if output.claim_evidence.is_empty() {
         return Err(AppError::Message(
             "The draft contained no evidence-linked claims. No artifact was published.".into(),
@@ -1147,7 +1147,11 @@ fn validate_citations(output: &AiPackageOutput, valid_ids: &HashSet<&str>) -> Ap
     Ok(())
 }
 
-fn fake_output(package: &ProspectPackage, play: &SalesPlay, draft_kind: &str) -> AiPackageOutput {
+fn fake_output(
+    package: &ProspectPackage,
+    play: &SalesPlay,
+    draft_kind: &str,
+) -> DraftPackageOutput {
     let evidence = &package.evidence[0];
     let signal = package
         .signals
@@ -1166,7 +1170,7 @@ fn fake_output(package: &ProspectPackage, play: &SalesPlay, draft_kind: &str) ->
         play.offer.trim()
     );
     let id = evidence.id.clone();
-    AiPackageOutput {
+    DraftPackageOutput {
         reasons: vec![CitedReason {
             text: "The account has current, attributable public evidence.".into(),
             evidence_ids: vec![id.clone()],
@@ -1475,7 +1479,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_evidence_ids() {
-        let output = AiPackageOutput {
+        let output = DraftPackageOutput {
             reasons: vec![CitedReason {
                 text: "Reason".into(),
                 evidence_ids: vec!["missing".into()],

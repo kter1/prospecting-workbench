@@ -381,7 +381,7 @@ pub const CASES: &[Case] = &[
     },
     Case {
         name: "voice intake for plumbers",
-        query: "I sell an AI voice receptionist that answers calls for plumbers",
+        query: "I sell an automated voice receptionist that answers calls for plumbers",
         geography: "Pennsylvania",
         sites: &[
             Site {
@@ -422,7 +422,7 @@ mod tests {
 
     async fn brief_for(case: &Case) -> SearchBrief {
         let mut brief =
-            crate::ai::interpret_search_brief(case.query, None, case.geography, 25, None)
+            crate::local_model::interpret_search_brief(case.query, None, case.geography, 25, None)
                 .await
                 .unwrap();
         brief.approved = true;

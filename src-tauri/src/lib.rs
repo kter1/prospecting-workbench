@@ -1,10 +1,10 @@
 mod adapters;
-mod ai;
 mod catalog;
 mod db;
 mod error;
 #[cfg(test)]
 mod eval_fixtures;
+mod local_model;
 mod matcher;
 mod models;
 mod qualification;
@@ -153,7 +153,7 @@ async fn propose_sales_play(
     } else {
         context.chars().take(5_000).collect()
     };
-    ai::propose_sales_play(&state.client, &source_text, current).await
+    local_model::propose_sales_play(&state.client, &source_text, current).await
 }
 
 #[tauri::command]
@@ -169,7 +169,7 @@ async fn interpret_prospecting_query(
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().chars().take(500).collect::<String>());
     let play = db::load_sales_play(&*state.connection()?)?;
-    let mut brief = ai::interpret_search_brief(
+    let mut brief = local_model::interpret_search_brief(
         &clean_query,
         product_reference.as_deref(),
         &geography,
@@ -212,7 +212,13 @@ async fn suggest_signal_rules(
         .take(8)
         .map(|label| label.chars().take(80).collect())
         .collect::<Vec<String>>();
-    match ai::propose_signal_rules(&state.client, &query, &segment_labels, &existing).await {
+    // The current rules are shown to the model as examples, so they get the
+    // same bounds as any rule the plan editor sends.
+    let mut existing = existing;
+    existing.truncate(10);
+    signals::sanitize_rules(&mut existing);
+    match local_model::propose_signal_rules(&state.client, &query, &segment_labels, &existing).await
+    {
         Ok((rules, message)) => Ok(SignalSuggestions { rules, message }),
         // A suggestion failure never blocks a search; the plan already has rules.
         Err(error) => Ok(SignalSuggestions {
@@ -423,7 +429,7 @@ async fn draft_readiness_for(state: &AppState, account_id: &str) -> AppResult<Dr
     if package.evidence.is_empty() {
         blockers.push("Research must produce cited evidence before drafting.".into());
     }
-    let ollama = ai::ollama_health(&state.client).await;
+    let ollama = local_model::ollama_health(&state.client).await;
     if !ollama.reachable || !ollama.model_installed {
         blockers.push(ollama.message.clone());
     }
@@ -549,7 +555,7 @@ fn list_jobs(state: State<'_, AppState>) -> AppResult<Vec<ResearchJob>> {
 
 #[tauri::command]
 async fn ollama_health(state: State<'_, AppState>) -> Result<OllamaHealth, AppError> {
-    Ok(ai::ollama_health(&state.client).await)
+    Ok(local_model::ollama_health(&state.client).await)
 }
 
 #[tauri::command]
@@ -578,7 +584,7 @@ fn export_data(state: State<'_, AppState>) -> AppResult<String> {
 
 #[tauri::command]
 async fn export_diagnostics(state: State<'_, AppState>) -> AppResult<String> {
-    let health = ai::ollama_health(&state.client).await;
+    let health = local_model::ollama_health(&state.client).await;
     let payload = {
         let connection = state.connection()?;
         let account_count: i64 =
@@ -711,7 +717,7 @@ async fn execute_generation_job(state: &AppState, app: &AppHandle, job_id: &str)
         ));
     }
     publish_job_progress(state, app, job_id, 20, "Composing locally")?;
-    let (assessment, mut draft, brief) = ai::generate_with_progress(
+    let (assessment, mut draft, brief) = local_model::generate_with_progress(
         &state.client,
         &package,
         &play,
@@ -1055,7 +1061,7 @@ async fn resolve_and_discover_reference_data(
     // proposes the kinds of organization that serve it, and those go first
     // because they are far likelier to be real Wikidata classes than raw
     // keywords from the sentence. Keyword pairs remain the offline fallback.
-    let mut phrases = ai::propose_audience_types(&state.client, query)
+    let mut phrases = local_model::propose_audience_types(&state.client, query)
         .await
         .unwrap_or_default();
     let proposed = phrases.clone();
@@ -1286,7 +1292,7 @@ async fn discover_candidates(
                 }
             }
             "wikidata" => {
-                let terms = ai::reference_terms(&brief.query);
+                let terms = local_model::reference_terms(&brief.query);
                 let scope = regions::wikidata_state(&brief.geography)
                     .map(|state| state.id)
                     .unwrap_or("us");
@@ -1996,7 +2002,7 @@ mod live_eval {
         };
         let sink: ProgressSink = Arc::new(|_| {});
         for (query, geography) in BRIEFS {
-            let mut brief = ai::interpret_search_brief(query, None, geography, 10, None)
+            let mut brief = local_model::interpret_search_brief(query, None, geography, 10, None)
                 .await
                 .unwrap();
             brief.approved = true;
@@ -2145,7 +2151,7 @@ mod rescore_tests {
             robots: Arc::default(),
             fetcher: sites.clone(),
         };
-        let mut brief = ai::interpret_search_brief(
+        let mut brief = local_model::interpret_search_brief(
             "I sell payroll and shift scheduling software to restaurants with hourly staff",
             None,
             "Austin, TX",
