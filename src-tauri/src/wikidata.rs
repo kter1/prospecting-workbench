@@ -25,6 +25,7 @@ use serde_json::Value;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::DiscoveryResult;
+use crate::regions;
 use crate::safety::looks_like_embedded_instruction;
 
 const SEARCH_ENDPOINT: &str = "https://www.wikidata.org/w/api.php";
@@ -34,6 +35,9 @@ const SPARQL_ENDPOINT: &str = "https://query.wikidata.org/sparql";
 /// parallel queries per IP, and blocks clients that ignore its policy. One
 /// request at a time is the polite and sufficient choice here.
 const REQUEST_TIMEOUT_SECONDS: u64 = 30;
+/// A state-scoped query walks the located-in chain and may be slow on a large
+/// class; past this it falls back to the national query.
+const STATE_QUERY_TIMEOUT_SECONDS: u64 = 12;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// How many classes one search may target in total.
 const MAX_CLASSES: usize = 4;
@@ -127,11 +131,41 @@ fn instances_query(class_id: &str, limit: usize, offset: usize) -> String {
     )
 }
 
+/// The state-scoped variant: the same statement plus a located-in chain to
+/// one state, and that state's English label so the caller can confirm the id
+/// names the state it was filed under. Only validated ids vary.
+fn instances_in_state_query(class_id: &str, state_id: &str, limit: usize, offset: usize) -> String {
+    format!(
+        "SELECT ?item ?itemLabel ?site ?locLabel ?scopeName WHERE {{\n\
+           ?item wdt:P31/wdt:P279* wd:{class_id} ;\n\
+                 wdt:P856 ?site ;\n\
+                 wdt:P17 wd:Q30 ;\n\
+                 wdt:P131* wd:{state_id} .\n\
+           wd:{state_id} rdfs:label ?scopeName . FILTER(LANG(?scopeName) = \"en\")\n\
+           OPTIONAL {{ ?item wdt:P131 ?loc . }}\n\
+           SERVICE wikibase:label {{ bd:serviceParam wikibase:language \"en\". }}\n\
+         }}\n\
+         LIMIT {limit} OFFSET {offset}"
+    )
+}
+
 /// Map a SPARQL result set onto discovery results.
 ///
 /// Pure so the binding shape, injection filtering, and URL validation are
 /// testable against fixtures without touching the network.
+#[cfg(test)]
 pub fn parse_instances(payload: &Value, class_label: &str) -> Vec<DiscoveryResult> {
+    parse_scoped_instances(payload, class_label, None)
+}
+
+/// As `parse_instances`, for a state-scoped query. A row is kept only when the
+/// state id's label matches the expected state, so a wrong id can never file
+/// organizations under the wrong state.
+pub fn parse_scoped_instances(
+    payload: &Value,
+    class_label: &str,
+    scope: Option<&regions::WikidataState>,
+) -> Vec<DiscoveryResult> {
     let Some(bindings) = payload
         .pointer("/results/bindings")
         .and_then(Value::as_array)
@@ -172,9 +206,18 @@ pub fn parse_instances(payload: &Value, class_label: &str) -> Vec<DiscoveryResul
                     && !is_entity_id(value)
                     && !looks_like_embedded_instruction(value)
             });
-            let location = match locality {
-                Some(place) => format!("{place}, United States"),
-                None => "United States".to_string(),
+            if let Some(scope) = scope {
+                if text(binding, "scopeName").as_deref() != Some(scope.label) {
+                    return None;
+                }
+            }
+            let location = match (locality, scope) {
+                (Some(place), Some(scope)) if place != scope.label => {
+                    format!("{place}, {}, United States", scope.name)
+                }
+                (_, Some(scope)) => format!("{}, United States", scope.name),
+                (Some(place), None) => format!("{place}, United States"),
+                (None, None) => "United States".to_string(),
             };
             Some(DiscoveryResult {
                 source: "Wikidata".into(),
@@ -318,12 +361,13 @@ async fn instances_of(
     class: &OrganizationClass,
     limit: usize,
     offset: usize,
+    scope: Option<&regions::WikidataState>,
 ) -> AppResult<Vec<DiscoveryResult>> {
-    let page = fetch_instances(client, class, limit, offset).await?;
+    let page = fetch_instances(client, class, limit, offset, scope).await?;
     if !page.is_empty() || offset == 0 {
         return Ok(page);
     }
-    fetch_instances(client, class, limit, 0).await
+    fetch_instances(client, class, limit, 0, scope).await
 }
 
 async fn fetch_instances(
@@ -331,45 +375,86 @@ async fn fetch_instances(
     class: &OrganizationClass,
     limit: usize,
     offset: usize,
+    scope: Option<&regions::WikidataState>,
 ) -> AppResult<Vec<DiscoveryResult>> {
+    let limit = limit.clamp(1, 500);
+    let (query, timeout) = match scope {
+        Some(scope) if is_entity_id(scope.id) => (
+            instances_in_state_query(&class.id, scope.id, limit, offset),
+            STATE_QUERY_TIMEOUT_SECONDS,
+        ),
+        _ => (
+            instances_query(&class.id, limit, offset),
+            REQUEST_TIMEOUT_SECONDS,
+        ),
+    };
     let response = client
         .get(SPARQL_ENDPOINT)
-        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
+        .timeout(std::time::Duration::from_secs(timeout))
         .header("Accept", "application/sparql-results+json")
-        .query(&[
-            ("format", "json"),
-            (
-                "query",
-                &instances_query(&class.id, limit.clamp(1, 500), offset),
-            ),
-        ])
+        .query(&[("format", "json"), ("query", &query)])
         .send()
         .await?;
-    Ok(parse_instances(
-        &limited_json(response, "Wikidata Query Service").await?,
-        &class.label,
-    ))
+    let payload = limited_json(response, "Wikidata Query Service").await?;
+    let results = parse_scoped_instances(&payload, &class.label, scope);
+    let rows = payload
+        .pointer("/results/bindings")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if let Some(scope) = scope {
+        if results.is_empty() && rows > 0 {
+            return Err(AppError::Message(format!(
+                "STATE_FILTER_MISMATCH: the Wikidata id for {} did not carry the expected label.",
+                scope.name
+            )));
+        }
+    }
+    Ok(results)
 }
 
 /// Fetch United States organizations that are instances of the given classes.
 ///
 /// One request per class, sequentially. A class that yields nothing or errors
 /// does not abandon the others, and no single statement can stall the lane.
+///
+/// With a state scope, each class is first queried within that state. The
+/// located-in chain can be slow on a large class, and an id can be wrong, so a
+/// failed scoped query falls back to the national one and says so in the
+/// returned warning; nothing outside the state is ever labelled as inside it.
 pub async fn discover_instances(
     client: &Client,
     classes: &[OrganizationClass],
     limit: usize,
     offset: usize,
-) -> AppResult<Vec<DiscoveryResult>> {
+    scope: Option<regions::WikidataState>,
+) -> AppResult<(Vec<DiscoveryResult>, Option<String>)> {
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut last_error = None;
+    let mut warning = None;
     for class in classes.iter().filter(|class| is_entity_id(&class.id)) {
         if results.len() >= limit {
             break;
         }
         let remaining = limit - results.len();
-        match instances_of(client, class, remaining, offset).await {
+        let found = match scope.as_ref() {
+            Some(state) => {
+                match instances_of(client, class, remaining, offset, Some(state)).await {
+                    Ok(found) => Ok(found),
+                    Err(error) => {
+                        warning = Some(format!(
+                        "Wikidata could not be filtered to {} for \"{}\" ({}), so organizations from the whole United States were collected and checked against the geography afterwards.",
+                        state.name,
+                        class.label,
+                        error.to_string().trim_start_matches("STATE_FILTER_MISMATCH: ")
+                    ));
+                        instances_of(client, class, remaining, offset, None).await
+                    }
+                }
+            }
+            None => instances_of(client, class, remaining, offset, None).await,
+        };
+        match found {
             Ok(found) => {
                 for result in found {
                     if seen.insert(result.source_url.clone()) {
@@ -384,7 +469,7 @@ pub async fn discover_instances(
     // still a useful answer.
     match (results.is_empty(), last_error) {
         (true, Some(error)) => Err(error),
-        _ => Ok(results),
+        _ => Ok((results, warning)),
     }
 }
 
@@ -586,5 +671,121 @@ mod tests {
         let mut parts = rest.splitn(2, ':');
         assert_eq!(parts.next().and_then(|v| v.parse::<i64>().ok()), Some(120));
         assert!(parts.next().is_some());
+    }
+
+    #[test]
+    fn the_state_template_only_varies_by_validated_ids_and_numbers() {
+        let query = instances_in_state_query("Q5354754", "Q1400", 25, 50);
+        assert!(query.contains("wdt:P131* wd:Q1400"));
+        assert!(query.contains("wd:Q1400 rdfs:label ?scopeName"));
+        assert!(query.contains("wdt:P17 wd:Q30"));
+        assert!(query.contains("LIMIT 25 OFFSET 50"));
+    }
+
+    #[test]
+    fn scoped_rows_are_kept_only_when_the_state_label_matches() {
+        let state = regions::wikidata_state("Pennsylvania").unwrap();
+        let row = |scope: &str| {
+            json!({"results":{"bindings":[{
+                "item":{"value":"http://www.wikidata.org/entity/Q42"},
+                "itemLabel":{"value":"Keystone Literary"},
+                "site":{"value":"https://keystoneliterary.example/"},
+                "locLabel":{"value":"Pittsburgh"},
+                "scopeName":{"value":scope}
+            }]}})
+        };
+        let kept = parse_scoped_instances(&row("Pennsylvania"), "literary agency", Some(&state));
+        assert_eq!(
+            kept[0].location.as_deref(),
+            Some("Pittsburgh, Pennsylvania, United States")
+        );
+        assert!(parse_scoped_instances(&row("Ohio"), "literary agency", Some(&state)).is_empty());
+    }
+
+    /// Checks every state id against live Wikidata labels. Needs network.
+    #[tokio::test]
+    #[ignore]
+    async fn live_state_ids_carry_their_expected_labels() {
+        let client = Client::new();
+        let mut wrong = Vec::new();
+        for name in [
+            "Alabama",
+            "Alaska",
+            "Arizona",
+            "Arkansas",
+            "California",
+            "Colorado",
+            "Connecticut",
+            "Delaware",
+            "District of Columbia",
+            "Florida",
+            "Georgia",
+            "Hawaii",
+            "Idaho",
+            "Illinois",
+            "Indiana",
+            "Iowa",
+            "Kansas",
+            "Kentucky",
+            "Louisiana",
+            "Maine",
+            "Maryland",
+            "Massachusetts",
+            "Michigan",
+            "Minnesota",
+            "Mississippi",
+            "Missouri",
+            "Montana",
+            "Nebraska",
+            "Nevada",
+            "New Hampshire",
+            "New Jersey",
+            "New Mexico",
+            "New York",
+            "North Carolina",
+            "North Dakota",
+            "Ohio",
+            "Oklahoma",
+            "Oregon",
+            "Pennsylvania",
+            "Rhode Island",
+            "South Carolina",
+            "South Dakota",
+            "Tennessee",
+            "Texas",
+            "Utah",
+            "Vermont",
+            "Virginia",
+            "Washington",
+            "West Virginia",
+            "Wisconsin",
+            "Wyoming",
+        ] {
+            let state = regions::wikidata_state(name).unwrap();
+            let payload: Value = client
+                .get(SEARCH_ENDPOINT)
+                .query(&[
+                    ("action", "wbgetentities"),
+                    ("ids", state.id),
+                    ("props", "labels"),
+                    ("languages", "en"),
+                    ("format", "json"),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let label = payload
+                .pointer(&format!("/entities/{}/labels/en/value", state.id))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if label != state.label {
+                wrong.push(format!("{name}: {} is labelled {label:?}", state.id));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

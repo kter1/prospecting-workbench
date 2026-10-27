@@ -1172,4 +1172,26 @@ mod tests {
         )
         .is_empty());
     }
+
+    #[test]
+    fn detected_technologies_count_as_signals_and_competitor_exclusions() {
+        let mut package = package();
+        package.evidence[0].source_kind = "technology_detected".into();
+        package.evidence[0].title = "Website technology: Toast POS".into();
+        package.evidence[0].excerpt = crate::technology::describe(
+            crate::technology::find("toast").unwrap(),
+            &url::Url::parse("https://acme.example/").unwrap(),
+        );
+        assert_eq!(
+            matching_signal_evidence_ids(&package, &["toasttab".into()]),
+            vec!["e".to_string()]
+        );
+        let mut brief = brief_with(vec![], &[], "United States");
+        brief.exclusions = vec!["toast pos".into()];
+        assert!(assess_for_search(&package, &brief)
+            .assessment
+            .hard_gates
+            .iter()
+            .any(|gate| gate.status == "fail"));
+    }
 }

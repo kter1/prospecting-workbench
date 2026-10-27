@@ -12,6 +12,7 @@ mod regions;
 mod research;
 mod safety;
 mod signals;
+mod technology;
 mod wikidata;
 
 use std::collections::HashMap;
@@ -1030,6 +1031,7 @@ async fn resolve_and_discover_reference_data(
     run_id: &str,
     query: &str,
     terms: &str,
+    geography: &str,
     limit: usize,
     rotation: usize,
 ) -> AppResult<Vec<DiscoveryResult>> {
@@ -1097,7 +1099,27 @@ async fn resolve_and_discover_reference_data(
     // Rotation pages deeper into the same class so a repeat search surfaces
     // organizations the previous run did not reach.
     let offset = rotation.saturating_mul(limit.max(1)) % 1_000;
-    wikidata::discover_instances(&state.client, &classes, limit, offset).await
+    let (found, warning) = wikidata::discover_instances(
+        &state.client,
+        &classes,
+        limit,
+        offset,
+        regions::wikidata_state(geography),
+    )
+    .await?;
+    if let Some(message) = warning {
+        db::add_search_warning(
+            &*state.connection()?,
+            run_id,
+            SourceWarning {
+                source: "Open reference data".into(),
+                message,
+                used_cached_results: false,
+                cache_age_hours: None,
+            },
+        )?;
+    }
+    Ok(found)
 }
 
 async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str) -> AppResult<()> {
@@ -1248,7 +1270,10 @@ async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str)
             }
             "wikidata" => {
                 let terms = ai::reference_terms(&brief.query);
-                let cache_key = format!("wikidata:{terms}:r{rotation}");
+                let scope = regions::wikidata_state(&brief.geography)
+                    .map(|state| state.id)
+                    .unwrap_or("us");
+                let cache_key = format!("wikidata:{terms}:{scope}:r{rotation}");
                 let cached = db::cached_discoveries(&*state.connection()?, &cache_key)?;
                 let backoff = db::source_backoff(&*state.connection()?, "wikidata")?;
                 if let Some((cached_results, _age)) = cached.as_ref().filter(|(_, age)| *age < 24) {
@@ -1276,6 +1301,7 @@ async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str)
                         run_id,
                         &brief.query,
                         &terms,
+                        &brief.geography,
                         candidate_budget,
                         rotation,
                     )

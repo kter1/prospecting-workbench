@@ -2016,7 +2016,7 @@ pub fn cached_page(
 ) -> AppResult<Option<FetchResult>> {
     let row = connection
         .query_row(
-            "SELECT final_url,title,text,links_json,etag,modified_at,fetched_at FROM page_cache WHERE account_id=?1 AND url=?2",
+            "SELECT final_url,title,text,links_json,etag,modified_at,fetched_at,technologies_json FROM page_cache WHERE account_id=?1 AND url=?2",
             params![account_id, url],
             |row| {
                 Ok((
@@ -2027,11 +2027,14 @@ pub fn cached_page(
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((final_url, title, text, links_json, etag, modified_at, fetched_at)) = row else {
+    let Some((final_url, title, text, links_json, etag, modified_at, fetched_at, technologies)) =
+        row
+    else {
         return Ok(None);
     };
     let fresh = chrono::DateTime::parse_from_rfc3339(&fetched_at).is_ok_and(|fetched| {
@@ -2058,6 +2061,7 @@ pub fn cached_page(
         links,
         etag,
         modified_at,
+        technologies: serde_json::from_str(&technologies).unwrap_or_default(),
     }))
 }
 
@@ -2069,10 +2073,11 @@ pub fn store_page(
 ) -> AppResult<()> {
     let links = page.links.iter().map(url::Url::as_str).collect::<Vec<_>>();
     connection.execute(
-        "INSERT INTO page_cache(account_id,url,final_url,title,text,links_json,etag,modified_at,fetched_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+        "INSERT INTO page_cache(account_id,url,final_url,title,text,links_json,etag,modified_at,fetched_at,technologies_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
          ON CONFLICT(account_id,url) DO UPDATE SET final_url=excluded.final_url,title=excluded.title,text=excluded.text,
-           links_json=excluded.links_json,etag=excluded.etag,modified_at=excluded.modified_at,fetched_at=excluded.fetched_at",
+           links_json=excluded.links_json,etag=excluded.etag,modified_at=excluded.modified_at,fetched_at=excluded.fetched_at,
+           technologies_json=excluded.technologies_json",
         params![
             account_id,
             url,
@@ -2082,7 +2087,8 @@ pub fn store_page(
             serde_json::to_string(&links)?,
             page.etag,
             page.modified_at,
-            now()
+            now(),
+            serde_json::to_string(&page.technologies)?
         ],
     )?;
     Ok(())
@@ -3232,6 +3238,7 @@ mod tests {
             links: vec![Url::parse("https://acme.example/about").unwrap()],
             etag: None,
             modified_at: None,
+            technologies: vec![],
         };
         store_page(&connection, "a", "https://acme.example/", &page).unwrap();
         let cached = cached_page(&connection, "a", "https://acme.example/")
