@@ -1,4 +1,4 @@
-import type { SearchBrief, SearchRun } from "../types";
+import type { QualificationRule, SearchBrief, SearchRun } from "../types";
 
 export function searchProgress(run?: Pick<SearchRun, "status" | "progressPercent">): number {
   if (run?.status === "complete") return 100;
@@ -146,4 +146,46 @@ export function buildBrowserPreviewBrief(query: string, geography: string, resul
     promptVersion: "browser-preview",
     createdAt: new Date().toISOString()
   };
+}
+
+/**
+ * Keywords from the editor's comma-separated text. Quoted phrases keep their
+ * quotes, which tell the matcher to compare exact words ("locations" means
+ * more than one), and may themselves contain commas.
+ */
+export function parseKeywords(text: string): string[] {
+  const keywords: string[] = [];
+  const pattern = /\s*"([^"]*)"\s*|([^,]+)/g;
+  for (const match of text.matchAll(pattern)) {
+    const value = match[1] !== undefined ? `"${match[1].trim()}"` : match[2].trim();
+    if (value && value !== '""' && !keywords.some((existing) => existing.toLowerCase() === value.toLowerCase())) keywords.push(value);
+  }
+  return keywords;
+}
+
+/** The editor's text for a keyword list. */
+export function formatKeywords(keywords: string[]): string {
+  return keywords.join(", ");
+}
+
+/**
+ * Add model suggestions to the plan's rules. A suggestion never replaces or
+ * duplicates a rule already there, by id or by label, so a rule the user
+ * edited is never overwritten when suggestions arrive late.
+ */
+export function mergeSuggestedRules(existing: QualificationRule[], suggested: QualificationRule[], limit = 10): QualificationRule[] {
+  const merged = [...existing];
+  for (const rule of suggested) {
+    if (merged.length >= limit) break;
+    const duplicate = merged.some((item) => item.id === rule.id || item.label.trim().toLowerCase() === rule.label.trim().toLowerCase());
+    if (!duplicate) merged.push(rule);
+  }
+  return merged;
+}
+
+/** A new, empty rule the user is about to fill in. */
+export function blankRule(existing: QualificationRule[]): QualificationRule {
+  let index = existing.length + 1;
+  while (existing.some((rule) => rule.id === `user_${index}`)) index += 1;
+  return { id: `user_${index}`, label: "", component: "signal", keywords: [], points: 45, hardGate: false, origin: "user" };
 }

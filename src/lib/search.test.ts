@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildBrowserPreviewBrief, canRunAutomatically, coverageLabel, guidedSearchQueries, queryKeywords, safePublicWebsite, searchProgress, shortfallExplanation } from "./search";
+import { blankRule, buildBrowserPreviewBrief, canRunAutomatically, coverageLabel, guidedSearchQueries, mergeSuggestedRules, parseKeywords, queryKeywords, safePublicWebsite, searchProgress, shortfallExplanation } from "./search";
 
 describe("prompt-first search helpers", () => {
   it("does not claim automatic coverage for guided-only briefs", () => {
@@ -99,5 +99,33 @@ describe("prompt-first search helpers", () => {
     expect(safePublicWebsite("file:///tmp/prospect")).toBeUndefined();
     expect(safePublicWebsite("javascript:alert(1)")).toBeUndefined();
     expect(safePublicWebsite("not a url")).toBeUndefined();
+  });
+});
+
+describe("signal editing helpers", () => {
+  const rule = (id: string, label: string) => ({ id, label, component: "signal" as const, keywords: ["a phrase"], points: 45, hardGate: false, origin: "pack" as const });
+
+  it("parses comma-separated keywords and keeps quoted phrases whole", () => {
+    expect(parseKeywords(' now hiring servers, weekly pay ,, "locations", "one, two", Weekly Pay')).toEqual([
+      "now hiring servers",
+      "weekly pay",
+      '"locations"',
+      '"one, two"'
+    ]);
+    expect(parseKeywords('""')).toEqual([]);
+  });
+
+  it("merges suggestions without duplicating or replacing existing rules", () => {
+    const edited = { ...rule("hourly_hiring", "Hiring hourly staff"), keywords: ["edited by the user"] };
+    const merged = mergeSuggestedRules([edited], [rule("hourly_hiring", "Anything"), rule("model_x", "hiring HOURLY staff "), rule("model_tips", "Tipped staff")]);
+    expect(merged.map((item) => item.id)).toEqual(["hourly_hiring", "model_tips"]);
+    expect(merged[0].keywords).toEqual(["edited by the user"]);
+    expect(mergeSuggestedRules([rule("a", "A")], [rule("b", "B"), rule("c", "C")], 2).map((item) => item.id)).toEqual(["a", "b"]);
+  });
+
+  it("creates blank rules with unique ids", () => {
+    const first = blankRule([]);
+    expect(first.origin).toBe("user");
+    expect(blankRule([first, { ...first, id: "user_2" }]).id).toBe("user_3");
   });
 });

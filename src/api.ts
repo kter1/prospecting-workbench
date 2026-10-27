@@ -15,7 +15,9 @@ import type {
   SearchBrief,
   SearchRun,
   SearchRunSummary,
-  SalesPlay
+  SalesPlay,
+  QualificationRule,
+  SignalSuggestions
 } from "./types";
 
 export const isDesktopRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -40,6 +42,10 @@ export const api = {
     invoke<SalesPlay>("propose_sales_play", { context, current }),
   interpretProspectingQuery: (query: string, geography: string, resultLimit: number, productWebsite?: string) =>
     isDesktopRuntime ? invoke<SearchBrief>("interpret_prospecting_query", { query, geography, resultLimit, productWebsite }) : Promise.resolve(buildBrowserPreviewBrief(query, geography, resultLimit)),
+  suggestSignalRules: (query: string, segmentLabels: string[], existing: QualificationRule[]) =>
+    isDesktopRuntime
+      ? invoke<SignalSuggestions>("suggest_signal_rules", { query, segmentLabels, existing })
+      : Promise.resolve<SignalSuggestions>({ rules: [], message: "Browser preview; launch the desktop app for local-model suggestions." }),
   startSearchRun: (brief: SearchBrief) =>
     isDesktopRuntime ? invoke<SearchRun>("start_search_run", { brief }) : Promise.resolve<SearchRun>({ id: crypto.randomUUID(), query: brief.query, briefId: brief.id, status: "complete", progressCompleted: 0, progressTotal: 0, progressPercent: 100, progressStage: "Complete", resultLimit: brief.resultLimit, candidateCount: 0, researchedCount: 0, strongCount: 0, nearMatchCount: 0, warnings: [], startedAt: new Date().toISOString(), completedAt: new Date().toISOString(), accounts: [] }),
   listSearchRuns: () => isDesktopRuntime ? invoke<SearchRunSummary[]>("list_search_runs") : Promise.resolve([]),

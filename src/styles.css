@@ -329,3 +329,17 @@ input:focus, textarea:focus, select:focus { border-color: #77a88b; box-shadow: 0
 .confirm-modal .receipt-actions { justify-content: flex-end; }
 .button.danger-solid { color: white; background: var(--red); border-color: var(--red); box-shadow: 0 7px 16px rgba(160,68,60,.16); }
 .button.danger-solid:hover:not(:disabled) { background: #8d3a33; }
+
+.signal-editor { margin-top: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: #fafaf7; }
+.signal-editor-heading { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.signal-editor-heading p { margin: 6px 0 0; color: #4e5751; font-size: 11px; line-height: 1.55; }
+.signal-status { color: #4e5751; font-size: 11px; max-width: 45%; text-align: right; }
+.signal-list { list-style: none; margin: 12px 0; padding: 0; display: grid; gap: 10px; }
+.signal-row { display: grid; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.signal-row-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.signal-row-top .signal-label { flex: 1 1 220px; font-weight: 600; }
+.signal-required { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
+.signal-row input[type="checkbox"] { width: auto; }
+.rule-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.rule-health { margin: 10px 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fafaf7; font-size: 11px; }
+.rule-health ul { margin: 6px 0 0; padding-left: 18px; }

@@ -69,6 +69,15 @@ export interface QualificationRule {
   keywords: string[];
   points: number;
   hardGate: boolean;
+  /** Where the rule came from. Older stored briefs have none. */
+  origin?: RuleOrigin;
+}
+
+export type RuleOrigin = "catalog" | "pack" | "model" | "query" | "user" | "";
+
+export interface SignalSuggestions {
+  rules: QualificationRule[];
+  message: string;
 }
 
 export interface DiscoveryLane {

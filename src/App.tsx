@@ -4,7 +4,8 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { listen } from "@tauri-apps/api/event";
 import { api, isDesktopRuntime } from "./api";
 import { parseSeedInput } from "./lib/csv";
-import { canRunAutomatically, coverageLabel, guidedSearchQueries, safePublicWebsite, searchProgress, shortfallExplanation } from "./lib/search";
+import { SignalEditor } from "./SignalEditor";
+import { canRunAutomatically, coverageLabel, guidedSearchQueries, mergeSuggestedRules, safePublicWebsite, searchProgress, shortfallExplanation } from "./lib/search";
 import type {
   Account,
   DashboardSnapshot,
@@ -592,6 +593,7 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
   const [searching, setSearching] = useState(false);
   const [clock, setClock] = useState(Date.now());
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set());
+  const [suggestionStatus, setSuggestionStatus] = useState<string>();
   const planRef = useRef<HTMLElement>(null);
 
   // The plan compiles instantly and offline, and renders below the prompt. On a
@@ -601,6 +603,24 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
     if (!brief) return;
     planRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     planRef.current?.focus({ preventScroll: true });
+  }, [brief?.id]);
+
+  // Ask the local model for product-specific signals once per plan. The plan is
+  // usable immediately; suggestions merge in when they arrive and never
+  // overwrite a rule the user has already edited.
+  useEffect(() => {
+    if (!brief || brief.interpreter === "browser_preview") return;
+    const planId = brief.id;
+    let current = true;
+    setSuggestionStatus("Asking the local model for signals specific to your product…");
+    api.suggestSignalRules(brief.query, brief.segments.map((segment) => segment.label), brief.positiveSignals)
+      .then((result) => {
+        if (!current) return;
+        setBrief((latest) => latest && latest.id === planId ? { ...latest, positiveSignals: mergeSuggestedRules(latest.positiveSignals, result.rules) } : latest);
+        setSuggestionStatus(result.message);
+      })
+      .catch((reason) => { if (current) setSuggestionStatus(`Local model suggestions are unavailable: ${String(reason)}`); });
+    return () => { current = false; };
   }, [brief?.id]);
 
   useEffect(() => setSelectedAccounts(new Set()), [activeRun?.id]);
@@ -704,10 +724,10 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
       <p className="muted">Sources: {coverageLabel(brief)}. Searching visits public websites; reviewing this plan does not.</p>
       <div className="receipt-grid">
         <div><span className="eyebrow">Outcome</span><p>{brief.customerOutcome}</p></div>
-        <div><span className="eyebrow">Signals</span><div className="chip-row">{brief.positiveSignals.map((item) => <span className="chip" key={item.id}>{item.label}</span>)}</div></div>
         <div><span className="eyebrow">Personas</span><div className="chip-row">{brief.targetPersonas.map((item) => <span className="chip" key={item}>{item}</span>)}</div></div>
         <div><span className="eyebrow">Exclusions</span><div className="chip-row">{brief.exclusions.length ? brief.exclusions.map((item) => <span className="chip muted-chip" key={item}>{item}</span>) : <span className="muted">None proposed</span>}</div></div>
       </div>
+      <SignalEditor rules={brief.positiveSignals} status={suggestionStatus} onChange={(positiveSignals) => setBrief({ ...brief, positiveSignals })} />
       <div className="lane-list">{brief.discoveryLanes.map((lane) => <div key={lane.id}><Badge tone={lane.mode === "automatic" ? "success" : "neutral"}>{lane.mode}</Badge><span><strong>{lane.label}</strong><small>{lane.reason} {lane.limitation}</small></span></div>)}</div>
       {brief.assumptions.length > 0 && <div className="assumption-box"><strong>Assumptions to review</strong><ul>{brief.assumptions.map((item) => <li key={item}>{item}</li>)}</ul></div>}
       <details className="advanced-brief"><summary>Edit boundaries</summary><div className="form-grid"><label>Geography<input value={brief.geography} onChange={(event) => setBrief({ ...brief, geography: event.target.value })} /></label><label>Qualification threshold<input type="number" min={1} max={100} value={brief.qualificationThreshold} onChange={(event) => setBrief({ ...brief, qualificationThreshold: Number(event.target.value) })} /></label><label>Maximum primary score span<input type="number" min={0} max={20} value={brief.qualityBand} onChange={(event) => setBrief({ ...brief, qualityBand: Number(event.target.value) })} /></label><label className="span-2">Exclusions<textarea value={brief.exclusions.join("\n")} onChange={(event) => setBrief({ ...brief, exclusions: splitList(event.target.value) })} /></label></div></details>
