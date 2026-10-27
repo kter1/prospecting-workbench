@@ -169,6 +169,17 @@ pub struct SearchRunAccount {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RuleHitRate {
+    pub rule_id: String,
+    pub label: String,
+    pub hits: i64,
+    pub assessed: i64,
+    /// `ok`, `too_few`, `never_found` or `not_discriminating`.
+    pub verdict: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceWarning {
     pub source: String,
     pub message: String,
@@ -204,6 +215,9 @@ pub struct SearchRun {
     pub completed_at: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// How often each plan rule fired across the assessed candidates.
+    #[serde(default)]
+    pub rule_health: Vec<RuleHitRate>,
     pub accounts: Vec<SearchRunAccount>,
 }
 

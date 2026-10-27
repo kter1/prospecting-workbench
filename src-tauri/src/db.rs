@@ -83,6 +83,10 @@ pub fn open(path: &Path) -> AppResult<Connection> {
     migrate_search_progress_schema(&connection)?;
     migrate_quality_first_schema(&connection)?;
     migrate_prompt_first_data(&connection)?;
+    if !table_has_column(&connection, "search_runs", "reuse_from")? {
+        // A re-score run reuses the candidate list of this earlier run.
+        connection.execute("ALTER TABLE search_runs ADD COLUMN reuse_from TEXT", [])?;
+    }
     Ok(connection)
 }
 
@@ -1587,6 +1591,11 @@ pub fn get_search_run(connection: &Connection, run_id: &str) -> AppResult<Search
             })
         })
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    let rule_health = brief_id
+        .as_deref()
+        .and_then(|id| get_search_brief(connection, id).ok())
+        .map(|brief| rule_hit_rates(&brief.positive_signals, &accounts))
+        .unwrap_or_default();
     Ok(SearchRun {
         id,
         query,
@@ -1605,8 +1614,112 @@ pub fn get_search_run(connection: &Connection, run_id: &str) -> AppResult<Search
         started_at,
         completed_at,
         last_error,
+        rule_health,
         accounts,
     })
+}
+
+pub fn set_search_run_reuse(connection: &Connection, run_id: &str, source: &str) -> AppResult<()> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM search_runs WHERE id=?1)",
+        params![source],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(AppError::Message(
+            "The search to re-score no longer exists.".into(),
+        ));
+    }
+    connection.execute(
+        "UPDATE search_runs SET reuse_from=?2 WHERE id=?1",
+        params![run_id, source],
+    )?;
+    Ok(())
+}
+
+pub fn search_run_reuse_source(connection: &Connection, run_id: &str) -> AppResult<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT reuse_from FROM search_runs WHERE id=?1",
+            params![run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Copy an earlier run's candidates into a new run, best first, for
+/// re-scoring under edited rules. Returns their account ids in that order.
+pub fn copy_search_candidates(
+    connection: &Connection,
+    from_run: &str,
+    to_run: &str,
+) -> AppResult<Vec<String>> {
+    let timestamp = now();
+    connection.execute(
+        "INSERT OR IGNORE INTO search_run_accounts(search_run_id,account_id,state,discovery_source,discovery_reason,created_at,updated_at,result_tier)
+         SELECT ?2,account_id,'screening',discovery_source,discovery_reason,?3,?3,'excluded'
+         FROM search_run_accounts WHERE search_run_id=?1",
+        params![from_run, to_run, timestamp],
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT account_id FROM search_run_accounts WHERE search_run_id=?1
+         ORDER BY COALESCE(rank,9999),COALESCE(score,-1) DESC,created_at",
+    )?;
+    let ids = statement
+        .query_map(params![from_run], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// How often each rule fired across a run's assessed candidates.
+///
+/// A rule that fires on nearly everyone cannot tell candidates apart, and one
+/// that never fires is probably worded differently from how sites write. Both
+/// are worth telling the user before they trust the ranking.
+pub fn rule_hit_rates(
+    rules: &[QualificationRule],
+    accounts: &[SearchRunAccount],
+) -> Vec<RuleHitRate> {
+    let assessed = accounts
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.state.as_str(),
+                "qualified" | "needs_review" | "rejected"
+            )
+        })
+        .collect::<Vec<_>>();
+    rules
+        .iter()
+        .map(|rule| {
+            let hits = assessed
+                .iter()
+                .filter(|item| {
+                    item.matched_features
+                        .iter()
+                        .any(|feature| feature.rule_id == rule.id)
+                })
+                .count() as i64;
+            let total = assessed.len() as i64;
+            let verdict = if total < 5 {
+                "too_few"
+            } else if hits == 0 {
+                "never_found"
+            } else if hits * 10 > total * 8 {
+                "not_discriminating"
+            } else {
+                "ok"
+            };
+            RuleHitRate {
+                rule_id: rule.id.clone(),
+                label: rule.label.clone(),
+                hits,
+                assessed: total,
+                verdict: verdict.into(),
+            }
+        })
+        .collect()
 }
 
 /// Counters and status for a run, without touching `search_run_accounts`.
@@ -3260,5 +3373,87 @@ mod tests {
             .query_row("SELECT count(*) FROM page_cache", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn rule_health_flags_rules_that_do_not_separate_candidates() {
+        let rule = |id: &str| QualificationRule {
+            id: id.into(),
+            label: id.into(),
+            component: "signal".into(),
+            keywords: vec!["x".into()],
+            points: 45,
+            hard_gate: false,
+            origin: "pack".into(),
+        };
+        let candidate = |matched: &[&str]| SearchRunAccount {
+            account: Account {
+                id: "a".into(),
+                name: "A".into(),
+                domain: None,
+                website_url: None,
+                industry: None,
+                employee_band: None,
+                location: None,
+                status: "new".into(),
+                score: None,
+                score_label: None,
+                researched_at: None,
+                created_at: "now".into(),
+                saved_at: None,
+                favorited_at: None,
+                trashed_at: None,
+            },
+            state: "needs_review".into(),
+            discovery_source: "s".into(),
+            discovery_reason: "r".into(),
+            score: None,
+            evidence_confidence: "medium".into(),
+            rejection_reasons: vec![],
+            matched_features: matched
+                .iter()
+                .map(|id| FitFeature {
+                    rule_id: (*id).into(),
+                    label: (*id).into(),
+                    component: "signal".into(),
+                    value: "present".into(),
+                    points_awarded: 45,
+                    evidence_ids: vec!["e".into()],
+                    confidence: "high".into(),
+                })
+                .collect(),
+            assessment: None,
+            rank: None,
+            result_tier: "near_match".into(),
+        };
+        // "everywhere" fires on all ten candidates, "some" on one.
+        let accounts = (0..10)
+            .map(|index| {
+                candidate(if index == 0 {
+                    &["everywhere", "some"][..]
+                } else {
+                    &["everywhere"][..]
+                })
+            })
+            .collect::<Vec<_>>();
+        let rates = rule_hit_rates(
+            &[rule("everywhere"), rule("some"), rule("nowhere")],
+            &accounts,
+        );
+        let verdict = |id: &str| {
+            rates
+                .iter()
+                .find(|rate| rate.rule_id == id)
+                .unwrap()
+                .verdict
+                .clone()
+        };
+        assert_eq!(verdict("everywhere"), "not_discriminating");
+        assert_eq!(verdict("some"), "ok");
+        assert_eq!(verdict("nowhere"), "never_found");
+        assert_eq!(
+            rule_hit_rates(&[rule("some")], &accounts[..3])[0].verdict,
+            "too_few"
+        );
     }
 }
