@@ -1,8 +1,17 @@
 use std::collections::HashSet;
 
+use crate::catalog;
+use crate::matcher::{self, Text};
 use crate::models::{
     CitedReason, FitAssessment, FitFeature, HardGate, ProspectPackage, SalesPlay, SearchBrief,
+    TargetSegment,
 };
+use crate::regions;
+
+/// Discovery records whose source query itself proved the organization type:
+/// an OpenStreetMap element returned by a category filter, or a Wikidata item
+/// returned as an instance of a resolved class.
+const TYPE_SCOPED_RECORDS: &[&str] = &["openstreetmap_record", "wikidata_record"];
 
 #[derive(Debug, Clone)]
 pub struct SearchQualification {
@@ -14,19 +23,27 @@ pub struct SearchQualification {
 }
 
 pub fn assess_for_search(package: &ProspectPackage, brief: &SearchBrief) -> SearchQualification {
-    let corpus = package
-        .evidence
-        .iter()
-        .map(|item| format!("{} {}", item.title, item.excerpt))
-        .chain(std::iter::once(format!(
-            "{} {} {}",
-            package.account.name,
-            package.account.location.as_deref().unwrap_or_default(),
-            package.account.industry.as_deref().unwrap_or_default()
-        )))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
+    let texts = evidence_texts(package);
+    let corpus = Text::new(
+        &package
+            .evidence
+            .iter()
+            .map(|item| {
+                if has_synthetic_title(&item.source_kind) {
+                    item.excerpt.clone()
+                } else {
+                    format!("{} {}", item.title, item.excerpt)
+                }
+            })
+            .chain(std::iter::once(format!(
+                "{} {} {}",
+                package.account.name,
+                package.account.location.as_deref().unwrap_or_default(),
+                package.account.industry.as_deref().unwrap_or_default()
+            )))
+            .collect::<Vec<_>>()
+            .join(" \n "),
+    );
 
     let identity_ids = package
         .evidence
@@ -43,8 +60,8 @@ pub fn assess_for_search(package: &ProspectPackage, brief: &SearchBrief) -> Sear
     let excluded = brief
         .exclusions
         .iter()
-        .find(|value| !value.trim().is_empty() && corpus.contains(&value.to_ascii_lowercase()));
-    let hard_gates = vec![
+        .find(|value| !value.trim().is_empty() && corpus.mentions(value));
+    let mut hard_gates = vec![
         HardGate {
             label: "Stable public identity".into(),
             status: if identity_pass { "pass" } else { "unknown" }.into(),
@@ -75,23 +92,35 @@ pub fn assess_for_search(package: &ProspectPackage, brief: &SearchBrief) -> Sear
 
     let mut features = Vec::new();
     for segment in &brief.segments {
-        let needles = segment
-            .label
-            .split(|character: char| !character.is_ascii_alphanumeric())
-            .filter(|part| part.len() >= 4)
-            .map(str::to_ascii_lowercase)
-            .chain(
-                segment
-                    .discovery_category
+        let (label, evidence_ids) = if segment.id == catalog::GENERAL_BUSINESS {
+            // "General private businesses" names no type a page could state.
+            // Only a discovery source that searched by type can establish it.
+            (
+                "Organization type established by the discovery source".to_string(),
+                package
+                    .evidence
                     .iter()
-                    .map(|value| value.replace('_', " ")),
+                    .filter(|item| TYPE_SCOPED_RECORDS.contains(&item.source_kind.as_str()))
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>(),
             )
-            .collect::<Vec<_>>();
-        let evidence_ids = matching_evidence_ids(package, &needles);
+        } else {
+            let needles = segment_needles(segment);
+            (
+                segment.label.clone(),
+                package
+                    .evidence
+                    .iter()
+                    .zip(&texts)
+                    .filter(|(_, text)| needles.iter().any(|needle| text.mentions(needle)))
+                    .map(|(item, _)| item.id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
         if !evidence_ids.is_empty() {
             features.push(FitFeature {
                 rule_id: format!("segment:{}", segment.id),
-                label: segment.label.clone(),
+                label,
                 component: "icp".into(),
                 value: "present".into(),
                 points_awarded: 70,
@@ -111,11 +140,27 @@ pub fn assess_for_search(package: &ProspectPackage, brief: &SearchBrief) -> Sear
             confidence: "medium".into(),
         });
     }
-    let mut awarded_signal_evidence = HashSet::new();
+    // One sentence is one piece of evidence. Keyed on the excerpt text rather
+    // than the row id, because the same line can be stored under two rows.
+    let mut awarded_excerpts = HashSet::new();
     for rule in &brief.positive_signals {
-        let evidence_ids = matching_signal_evidence_ids(package, &rule.keywords)
+        let matched = signal_matches(package, &texts, &rule.keywords);
+        if matched.is_empty() && rule.hard_gate {
+            hard_gates.push(HardGate {
+                label: format!("Required signal: {}", rule.label),
+                // Absent evidence is not counter-evidence, so this is unknown
+                // rather than a failure: the candidate stays reviewable.
+                status: "unknown".into(),
+                reason: format!(
+                    "Required signal not found in public evidence: {}.",
+                    rule.label
+                ),
+            });
+        }
+        let evidence_ids = matched
             .into_iter()
-            .filter(|id| awarded_signal_evidence.insert(id.clone()))
+            .filter(|item| awarded_excerpts.insert(matcher::normalized(&item.excerpt)))
+            .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         if !evidence_ids.is_empty() {
             features.push(FitFeature {
@@ -169,6 +214,12 @@ pub fn assess_for_search(package: &ProspectPackage, brief: &SearchBrief) -> Sear
                 .map(|gate| gate.reason.clone()),
         );
     }
+    rejection_reasons.extend(
+        hard_gates
+            .iter()
+            .filter(|gate| gate.status == "unknown" && gate.label.starts_with("Required signal"))
+            .map(|gate| gate.reason.clone()),
+    );
     if !direct_signal {
         rejection_reasons
             .push("No direct public evidence matched an approved product-relevant signal.".into());
@@ -213,19 +264,22 @@ pub fn assess_for_search(package: &ProspectPackage, brief: &SearchBrief) -> Sear
 }
 
 pub fn assess_for_play(package: &ProspectPackage, play: &SalesPlay) -> FitAssessment {
-    let corpus = package
-        .evidence
+    let corpus = Text::new(
+        &package
+            .evidence
+            .iter()
+            .map(|item| format!("{} {}", item.title, item.excerpt))
+            .collect::<Vec<_>>()
+            .join(" \n "),
+    );
+    let industry_match = play
+        .icp_industries
         .iter()
-        .map(|item| format!("{} {}", item.title, item.excerpt))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    let industry_match = play.icp_industries.iter().any(|industry| {
-        !industry.trim().is_empty() && corpus.contains(&industry.to_ascii_lowercase())
-    });
-    let excluded = play.exclusions.iter().find(|exclusion| {
-        !exclusion.trim().is_empty() && corpus.contains(&exclusion.to_ascii_lowercase())
-    });
+        .any(|industry| !industry.trim().is_empty() && corpus.mentions(industry));
+    let excluded = play
+        .exclusions
+        .iter()
+        .find(|exclusion| !exclusion.trim().is_empty() && corpus.mentions(exclusion));
     let hard_gates = vec![HardGate {
         label: "Approved exclusions".into(),
         status: if excluded.is_some() { "fail" } else { "pass" }.into(),
@@ -272,24 +326,55 @@ pub fn assess_for_play(package: &ProspectPackage, play: &SalesPlay) -> FitAssess
     }
 }
 
-fn matching_evidence_ids(package: &ProspectPackage, keywords: &[String]) -> Vec<String> {
-    let needles = keywords
+/// Evidence kinds whose title the application wrote rather than the page.
+///
+/// Matching those titles let a fact satisfy its own rule: an excerpt titled
+/// "After-hours service evidence" matched "after hours" even when the quoted
+/// line said "we do not offer emergency service".
+fn has_synthetic_title(source_kind: &str) -> bool {
+    ["workflow_", "rule_", "persona_", "technology_"]
         .iter()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| value.len() >= 3)
-        .collect::<Vec<_>>();
+        .any(|prefix| source_kind.starts_with(prefix))
+}
+
+/// The published text of each evidence row, in order.
+fn evidence_texts(package: &ProspectPackage) -> Vec<Text> {
     package
         .evidence
         .iter()
-        .filter(|item| {
-            let text = normalized_search_text(&format!("{} {}", item.title, item.excerpt));
-            needles.iter().any(|needle| contains_phrase(&text, needle))
+        .map(|item| {
+            if has_synthetic_title(&item.source_kind) {
+                Text::new(&item.excerpt)
+            } else {
+                Text::new(&format!("{} {}", item.title, item.excerpt))
+            }
         })
-        .map(|item| item.id.clone())
         .collect()
 }
 
-fn matching_signal_evidence_ids(package: &ProspectPackage, keywords: &[String]) -> Vec<String> {
+/// Phrases that establish a segment: its catalog id, curated synonyms, and its
+/// full label as one phrase. Never single words split out of the label, which
+/// is how "Law firms" used to match any page saying "firms".
+fn segment_needles(segment: &TargetSegment) -> Vec<String> {
+    let mut needles = vec![segment.label.clone()];
+    if let Some(category) = segment
+        .discovery_category
+        .as_deref()
+        .and_then(catalog::find)
+        .or_else(|| catalog::find(&segment.id))
+    {
+        needles.push(category.id.replace('_', " "));
+        needles.extend(category.synonyms.iter().map(|value| value.to_string()));
+    }
+    needles
+}
+
+/// Evidence that affirms any of `keywords`, from sources trusted for signals.
+fn signal_matches<'a>(
+    package: &'a ProspectPackage,
+    texts: &[Text],
+    keywords: &[String],
+) -> Vec<&'a crate::models::Evidence> {
     let needles = keywords
         .iter()
         .map(|value| value.trim().to_ascii_lowercase())
@@ -298,7 +383,8 @@ fn matching_signal_evidence_ids(package: &ProspectPackage, keywords: &[String]) 
     package
         .evidence
         .iter()
-        .filter(|item| {
+        .zip(texts)
+        .filter(|(item, text)| {
             let trusted_kind =
                 !item.source_kind.ends_with("_record") && item.source_kind != "user_import";
             // Only a contradiction disqualifies evidence from scoring. The
@@ -310,41 +396,26 @@ fn matching_signal_evidence_ids(package: &ProspectPackage, keywords: &[String]) 
                     .quality_flags
                     .iter()
                     .any(|flag| flag == "contradictory");
-            let text = normalized_search_text(&format!("{} {}", item.title, item.excerpt));
-            trusted_kind && usable && needles.iter().any(|needle| matches_keyword(&text, needle))
+            trusted_kind && usable && needles.iter().any(|needle| matches_keyword(text, needle))
         })
+        .map(|(item, _)| item)
+        .collect()
+}
+
+#[cfg(test)]
+fn matching_signal_evidence_ids(package: &ProspectPackage, keywords: &[String]) -> Vec<String> {
+    signal_matches(package, &evidence_texts(package), keywords)
+        .into_iter()
         .map(|item| item.id.clone())
         .collect()
 }
 
-fn normalized_search_text(value: &str) -> String {
-    value
-        .to_ascii_lowercase()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn contains_phrase(normalized_text: &str, needle: &str) -> bool {
-    let normalized_needle = normalized_search_text(needle);
-    !normalized_needle.is_empty()
-        && format!(" {normalized_text} ").contains(&format!(" {normalized_needle} "))
-}
-
 /// Keyword variants that mean the same thing in ordinary business copy.
 ///
-/// Exact-phrase matching alone missed the majority of real pages: a site
-/// saying "open 24 hours a day" or "call today" matched nothing, so the
-/// candidate scored zero signal relevance and could not qualify.
+/// The matcher already handles plurals, verb forms and a few words in between;
+/// this table covers genuine synonyms. A site saying "open 24 hours a day" or
+/// "call today" otherwise matches nothing, scores zero signal relevance and
+/// cannot qualify.
 fn keyword_variants(needle: &str) -> Vec<String> {
     let mut variants = vec![needle.to_string()];
     let extra: &[&str] = match needle {
@@ -393,22 +464,17 @@ fn keyword_variants(needle: &str) -> Vec<String> {
             "customer service rep",
             "call center",
         ],
-        "we are hiring" | "hiring" => &[
-            "we are hiring",
-            "we re hiring",
-            "now hiring",
-            "join our team",
-            "careers",
-        ],
+        "we are hiring" | "hiring" => &["we are hiring", "we re hiring", "now hiring"],
         "open positions" | "job openings" => {
             &["open positions", "job openings", "current openings"]
         }
-        "locations" | "service areas" | "areas we serve" => &[
-            "locations",
+        // Quoted: "location" in the singular is evidence of one premise, so
+        // these must not be stemmed into each other.
+        "locations" | "\"locations\"" | "service areas" | "areas we serve" => &[
+            "\"locations\"",
             "service areas",
             "areas we serve",
-            "serving",
-            "multiple locations",
+            "\"multiple locations\"",
         ],
         "new location" => &["new location", "newly opened", "now open in"],
         "launched" | "introducing" => &["launched", "introducing", "we launched", "announcing"],
@@ -420,47 +486,72 @@ fn keyword_variants(needle: &str) -> Vec<String> {
     variants
 }
 
-fn matches_keyword(normalized_text: &str, needle: &str) -> bool {
+pub(crate) fn matches_keyword(text: &Text, needle: &str) -> bool {
     keyword_variants(needle)
         .iter()
-        .any(|variant| contains_phrase(normalized_text, variant))
+        .any(|variant| text.affirms(variant))
 }
 
-fn geography_matches(package: &ProspectPackage, geography: &str, corpus: &str) -> bool {
-    let requested = geography.to_ascii_lowercase();
-    package.account.location.as_ref().is_some_and(|location| {
-        let location = location.to_ascii_lowercase();
-        requested.contains(&location)
-            || location.contains(&requested)
-            || requested.contains("united states")
-    }) || corpus.contains(&requested)
-        || (requested.contains("united states")
-            && [" united states", " u.s.", " usa "]
+/// Whether the account is inside the approved geography.
+///
+/// A recorded location is the strongest provenance, so when it can be placed it
+/// decides: a dentist recorded in New Jersey is not in Pennsylvania however
+/// often its pages mention Philadelphia. Only an account with no placeable
+/// location falls back to the evidence naming the place.
+fn geography_matches(package: &ProspectPackage, geography: &str, corpus: &Text) -> bool {
+    let requested = geography.trim();
+    let location = package.account.location.as_deref();
+    let Some(wanted) = regions::place(requested) else {
+        let normalized = matcher::normalized(requested);
+        let nationwide = normalized.is_empty()
+            || ["united states", "usa", "us", "u s", "nationwide", "america"]
                 .iter()
-                .any(|value| corpus.contains(value)))
+                .any(|value| Text::new(&normalized).mentions(value));
+        return if nationwide {
+            location.is_some()
+                || ["united states", "usa", "u s"]
+                    .iter()
+                    .any(|value| corpus.mentions(value))
+        } else {
+            location.is_some_and(|value| Text::new(value).mentions(requested))
+                || corpus.mentions(requested)
+        };
+    };
+    if let Some(found) = location.and_then(regions::place) {
+        return match wanted.metro {
+            Some(metro) => found.metro == Some(metro),
+            None => found.state == wanted.state,
+        };
+    }
+    match wanted.metro {
+        Some(metro) => corpus.mentions(metro.trim_end_matches(" metro")),
+        None => corpus.mentions(wanted.state),
+    }
 }
 
 fn persona_score(package: &ProspectPackage, personas: &[String]) -> i64 {
+    let personas = personas
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
     if personas.is_empty() {
         return 0;
     }
-    let personas = personas
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<Vec<_>>();
     if package.people.iter().any(|person| {
-        person.title.as_ref().is_some_and(|title| {
-            let title = title.to_ascii_lowercase();
-            personas
-                .iter()
-                .any(|persona| title.contains(persona) || persona.contains(&title))
-        })
+        person
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .is_some_and(|title| {
+                let title = Text::new(title);
+                personas.iter().any(|persona| title.mentions(persona))
+            })
     }) {
         100
     } else if package.evidence.iter().any(|item| {
-        personas
-            .iter()
-            .any(|persona| item.excerpt.to_ascii_lowercase().contains(persona))
+        let excerpt = Text::new(&item.excerpt);
+        personas.iter().any(|persona| excerpt.mentions(persona))
     }) {
         65
     } else {
@@ -704,7 +795,7 @@ mod tests {
 
     #[test]
     fn signal_matching_accepts_ordinary_business_phrasing() {
-        let text = normalized_search_text(
+        let text = Text::new(
             "We are open 24 hours a day. Call today to book an appointment with our dispatch team.",
         );
         assert!(matches_keyword(&text, "24 hour"));
@@ -781,5 +872,241 @@ mod tests {
             "unknown"
         );
         assert_ne!(result.state, "qualified");
+    }
+
+    fn brief_with(segments: Vec<TargetSegment>, personas: &[&str], geography: &str) -> SearchBrief {
+        SearchBrief {
+            id: "b".into(),
+            query: "q".into(),
+            product_summary: "p".into(),
+            customer_outcome: "o".into(),
+            segments,
+            geography: geography.into(),
+            company_sizes: vec![],
+            target_personas: personas.iter().map(|value| value.to_string()).collect(),
+            positive_signals: vec![],
+            exclusions: vec![],
+            discovery_lanes: vec![],
+            result_limit: 25,
+            qualification_threshold: 70,
+            quality_band: 4,
+            approved: true,
+            assumptions: vec![],
+            interpreter: "manual_rules".into(),
+            model_tag: None,
+            model_digest: None,
+            prompt_version: crate::models::SEARCH_PROMPT_VERSION.into(),
+            created_at: "now".into(),
+        }
+    }
+
+    #[test]
+    fn generic_words_in_a_category_label_do_not_establish_the_segment() {
+        let mut package = package();
+        package.account.industry = None;
+        package.evidence[0].title = "Brightline".into();
+        package.evidence[0].excerpt =
+            "We help professional services firms grow their brand.".into();
+        let law = TargetSegment {
+            id: "lawyer".into(),
+            label: "Law firms".into(),
+            discovery_category: Some("lawyer".into()),
+        };
+        let result = assess_for_search(&package, &brief_with(vec![law], &[], "United States"));
+        assert!(!result
+            .features
+            .iter()
+            .any(|f| f.rule_id == "segment:lawyer"));
+
+        package.evidence[0].excerpt = "Contact our general manager today.".into();
+        let general = TargetSegment {
+            id: catalog::GENERAL_BUSINESS.into(),
+            label: catalog::GENERAL_BUSINESS_LABEL.into(),
+            discovery_category: None,
+        };
+        let result = assess_for_search(
+            &package,
+            &brief_with(vec![general.clone()], &[], "United States"),
+        );
+        assert_eq!(result.assessment.icp_fit, 20, "only geography, no segment");
+
+        // A type-scoped discovery record does establish it.
+        package.evidence[0].source_kind = "wikidata_record".into();
+        let result = assess_for_search(&package, &brief_with(vec![general], &[], "United States"));
+        assert!(result
+            .features
+            .iter()
+            .any(|f| f.rule_id == "segment:general_business"));
+    }
+
+    #[test]
+    fn personas_match_whole_words_only() {
+        let mut package = package();
+        package.evidence[0].excerpt =
+            "Trusted by homeowners across Austin for twenty years.".into();
+        assert_eq!(persona_score(&package, &["Owner".into()]), 0);
+        package.evidence[0].excerpt = "Meet the owner, Maria Lopez, a master plumber.".into();
+        assert_eq!(persona_score(&package, &["Owner".into()]), 65);
+        package.people.push(crate::models::Person {
+            id: "p".into(),
+            account_id: "a".into(),
+            name: "Unknown".into(),
+            title: Some(String::new()),
+        });
+        package.evidence[0].excerpt = "Nothing relevant here at all.".into();
+        assert_eq!(
+            persona_score(&package, &["Owner".into()]),
+            0,
+            "an empty title matches nothing"
+        );
+    }
+
+    #[test]
+    fn exclusions_match_whole_phrases() {
+        let mut package = package();
+        package.evidence[0].excerpt = "Brunch favourites including avocado toast.".into();
+        let mut brief = brief_with(vec![], &[], "United States");
+        brief.exclusions = vec!["toast pos".into()];
+        assert!(assess_for_search(&package, &brief)
+            .assessment
+            .hard_gates
+            .iter()
+            .all(|gate| gate.status != "fail"));
+        package.evidence[0].excerpt = "Orders run through Toast POS at every register.".into();
+        assert!(assess_for_search(&package, &brief)
+            .assessment
+            .hard_gates
+            .iter()
+            .any(|gate| gate.status == "fail"));
+    }
+
+    #[test]
+    fn boilerplate_and_negated_hiring_is_not_a_signal() {
+        let mut package = package();
+        for excerpt in [
+            "Join our team. Careers at Congress Avenue Bistro.",
+            "We are not hiring at this time, but check back soon.",
+        ] {
+            package.evidence[0].excerpt = excerpt.into();
+            assert!(
+                matching_signal_evidence_ids(&package, &["we are hiring".into(), "hiring".into()])
+                    .is_empty(),
+                "{excerpt}"
+            );
+        }
+        package.evidence[0].excerpt =
+            "We're hiring servers and line cooks for weekend shifts.".into();
+        assert_eq!(
+            matching_signal_evidence_ids(&package, &["hiring".into()]),
+            vec!["e".to_string()]
+        );
+    }
+
+    #[test]
+    fn one_sentence_cannot_satisfy_two_rules() {
+        let mut package = package();
+        package.evidence.push(package.evidence[0].clone());
+        package.evidence[1].id = "e2".into();
+        let mut brief = brief_with(vec![], &[], "United States");
+        for (id, keyword) in [("first", "emergency"), ("second", "call now")] {
+            brief
+                .positive_signals
+                .push(crate::models::QualificationRule {
+                    id: id.into(),
+                    label: id.into(),
+                    component: "signal".into(),
+                    keywords: vec![keyword.into()],
+                    points: 45,
+                    hard_gate: false,
+                });
+        }
+        let result = assess_for_search(&package, &brief);
+        let awarded = result
+            .features
+            .iter()
+            .filter(|feature| feature.component == "signal")
+            .count();
+        assert_eq!(
+            awarded, 1,
+            "two copies of one sentence are one piece of evidence"
+        );
+    }
+
+    #[test]
+    fn an_unmatched_required_rule_keeps_the_candidate_out_of_qualified() {
+        let mut brief = brief_with(vec![], &[], "United States");
+        brief.qualification_threshold = 10;
+        brief
+            .positive_signals
+            .push(crate::models::QualificationRule {
+                id: "after_hours".into(),
+                label: "After hours".into(),
+                component: "signal".into(),
+                keywords: vec!["24 hour".into()],
+                points: 100,
+                hard_gate: false,
+            });
+        assert_eq!(assess_for_search(&package(), &brief).state, "qualified");
+        brief
+            .positive_signals
+            .push(crate::models::QualificationRule {
+                id: "portal".into(),
+                label: "Patient portal".into(),
+                component: "signal".into(),
+                keywords: vec!["patient portal".into()],
+                points: 45,
+                hard_gate: true,
+            });
+        let result = assess_for_search(&package(), &brief);
+        assert_eq!(result.state, "needs_review");
+        assert!(result
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.contains("Required signal not found")));
+    }
+
+    #[test]
+    fn geography_compares_states_and_metros() {
+        let mut package = package();
+        package.account.location = Some("Haddonfield, New Jersey, United States".into());
+        package.evidence[0].excerpt = "Serving patients from Philadelphia, Pennsylvania.".into();
+        let gate = |package: &ProspectPackage, geography: &str| {
+            assess_for_search(package, &brief_with(vec![], &[], geography))
+                .assessment
+                .hard_gates
+                .iter()
+                .find(|gate| gate.label.starts_with("Geography"))
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(
+            gate(&package, "Pennsylvania"),
+            "unknown",
+            "recorded location decides"
+        );
+        assert_eq!(gate(&package, "New Jersey"), "pass");
+        package.account.location = Some("Austin metro, Texas, United States".into());
+        assert_eq!(gate(&package, "Austin, TX"), "pass");
+        assert_eq!(gate(&package, "Texas"), "pass");
+        assert_eq!(gate(&package, "Houston"), "unknown");
+        // "United States" as a bare location no longer satisfies a city request.
+        package.account.location = Some("United States".into());
+        package.evidence[0].excerpt = "Plumbing.".into();
+        assert_eq!(gate(&package, "Austin, TX, United States"), "unknown");
+    }
+
+    #[test]
+    fn an_application_written_title_never_counts_as_evidence() {
+        let mut package = package();
+        package.evidence[0].source_kind = "workflow_after_hours".into();
+        package.evidence[0].title = "After-hours service evidence".into();
+        package.evidence[0].excerpt =
+            "We do not offer emergency service; all work is booked by email.".into();
+        assert!(matching_signal_evidence_ids(
+            &package,
+            &["after hours".into(), "emergency service".into()]
+        )
+        .is_empty());
     }
 }
