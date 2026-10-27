@@ -37,6 +37,9 @@ struct AppState {
     /// Parsed robots files by host, kept in memory for a day. Robots files are
     /// tiny and per-host, so a database round trip would cost more than it saves.
     robots: Arc<Mutex<HashMap<String, (Instant, String)>>>,
+    /// How research reaches public pages. Always the safety-checked public
+    /// fetcher in the app; tests substitute one that counts requests.
+    fetcher: Arc<dyn research::Fetcher>,
 }
 
 const ROBOTS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -224,6 +227,7 @@ async fn start_search_run(
     app: AppHandle,
     state: State<'_, AppState>,
     mut brief: SearchBrief,
+    reuse_candidates_from: Option<String>,
 ) -> AppResult<SearchRun> {
     if !brief
         .discovery_lanes
@@ -238,7 +242,17 @@ async fn start_search_run(
     // trusted to have bounded them.
     signals::sanitize_rules(&mut brief.positive_signals);
     brief.approved = true;
-    let run = db::create_search_run(&*state.connection()?, &brief)?;
+    let run = {
+        let connection = state.connection()?;
+        let run = db::create_search_run(&connection, &brief)?;
+        if let Some(source) = reuse_candidates_from.as_deref() {
+            if let Err(error) = db::set_search_run_reuse(&connection, &run.id, source) {
+                db::finish_search_run(&connection, &run.id, "failed", Some(&error.to_string()))?;
+                return Err(error);
+            }
+        }
+        run
+    };
     let background = state.inner().clone();
     let run_id = run.id.clone();
     tauri::async_runtime::spawn(async move {
@@ -252,6 +266,11 @@ async fn start_search_run(
         }
     });
     Ok(run)
+}
+
+#[tauri::command]
+fn get_search_brief(state: State<'_, AppState>, brief_id: String) -> AppResult<SearchBrief> {
+    db::get_search_brief(&*state.connection()?, &brief_id)
 }
 
 #[tauri::command]
@@ -776,11 +795,8 @@ async fn execute_research_with_depth(
     } else {
         (8, Duration::from_secs(60))
     };
-    let fetcher = research::PublicFetcher {
-        client: &state.client,
-    };
     let mut facts = research::Crawl {
-        fetcher: &fetcher,
+        fetcher: state.fetcher.as_ref(),
         cache: state,
         focus,
         personas,
@@ -1122,12 +1138,13 @@ async fn resolve_and_discover_reference_data(
     Ok(found)
 }
 
-async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str) -> AppResult<()> {
-    let brief = {
-        let connection = state.connection()?;
-        let run = db::get_search_run(&connection, run_id)?;
-        db::get_search_brief(&connection, &run.brief_id)?
-    };
+/// Discovery and import for a fresh run. `None` when the run was cancelled.
+async fn discover_candidates(
+    state: &AppState,
+    sink: &ProgressSink,
+    run_id: &str,
+    brief: &SearchBrief,
+) -> AppResult<Option<Vec<String>>> {
     publish_search_progress(state, sink, run_id, 2, "Preparing enabled sources")?;
     let candidate_budget = (brief.result_limit * 5).max(30).clamp(1, 100) as usize;
     // Shifts which bounded regions this run samples first. Without it, repeat
@@ -1377,8 +1394,8 @@ async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str)
         }
     }
     results.sort_by(|left, right| {
-        discovery_priority(right, &brief)
-            .cmp(&discovery_priority(left, &brief))
+        discovery_priority(right, brief)
+            .cmp(&discovery_priority(left, brief))
             .then_with(|| left.company_name.cmp(&right.company_name))
     });
     let mut seen = std::collections::HashSet::new();
@@ -1412,7 +1429,7 @@ async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str)
     let mut seen_accounts = std::collections::HashSet::new();
     for result in results {
         if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
-            return Ok(());
+            return Ok(None);
         }
         let account_id = db::import_discovery_result(&mut *state.connection()?, run_id, &result)?;
         db::update_search_run_account(
@@ -1434,6 +1451,43 @@ async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str)
             candidate_ids.push(account_id);
         }
     }
+    Ok(Some(candidate_ids))
+}
+
+async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str) -> AppResult<()> {
+    let brief = {
+        let connection = state.connection()?;
+        let run = db::get_search_run(&connection, run_id)?;
+        db::get_search_brief(&connection, &run.brief_id)?
+    };
+    // A re-score reuses the candidates of an earlier run instead of
+    // discovering new ones, so edited rules can be judged against the same
+    // companies, and their recently read pages come from the page cache.
+    let reuse_from = db::search_run_reuse_source(&*state.connection()?, run_id)?;
+    let candidate_ids = match reuse_from {
+        Some(source) => {
+            let ids = db::copy_search_candidates(&*state.connection()?, &source, run_id)?;
+            if ids.is_empty() {
+                return Err(AppError::Message(
+                    "The earlier search has no candidates to re-score.".into(),
+                ));
+            }
+            let total = ids.len() as i64;
+            db::set_search_run_counts(&*state.connection()?, run_id, total, 0)?;
+            publish_search_progress(
+                state,
+                sink,
+                run_id,
+                30,
+                &format!("Re-scoring {total} candidates from the earlier search"),
+            )?;
+            ids
+        }
+        None => match discover_candidates(state, sink, run_id, &brief).await? {
+            Some(ids) => ids,
+            None => return Ok(()),
+        },
+    };
     let total = candidate_ids.len() as i64;
     db::set_search_run_progress(&*state.connection()?, run_id, 0, total)?;
     publish_search_progress(
@@ -1705,6 +1759,9 @@ pub fn run() {
             let client = build_client()?;
             let state = AppState {
                 database: Arc::new(Mutex::new(connection)),
+                fetcher: Arc::new(research::PublicFetcher {
+                    client: client.clone(),
+                }),
                 client,
                 app_data_dir,
                 robots: Arc::default(),
@@ -1747,6 +1804,7 @@ pub fn run() {
             interpret_prospecting_query,
             suggest_signal_rules,
             start_search_run,
+            get_search_brief,
             list_search_runs,
             get_search_run,
             cancel_search_run,
@@ -1932,6 +1990,9 @@ mod live_eval {
             client: build_client().unwrap(),
             app_data_dir: directory.path().to_path_buf(),
             robots: Arc::default(),
+            fetcher: Arc::new(research::PublicFetcher {
+                client: build_client().unwrap(),
+            }),
         };
         let sink: ProgressSink = Arc::new(|_| {});
         for (query, geography) in BRIEFS {
@@ -2023,5 +2084,135 @@ mod live_eval {
                 }
             }
         }
+    }
+}
+
+/// Re-scoring an earlier run's candidates with edited rules.
+#[cfg(test)]
+mod rescore_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Serves each site's homepage, answers 404 for everything else, and
+    /// counts every request.
+    struct Sites {
+        homepages: HashMap<String, String>,
+        requests: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl research::Fetcher for Sites {
+        async fn fetch(&self, url: url::Url) -> AppResult<safety::FetchResult> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            match self.homepages.get(url.as_str()) {
+                Some(text) => Ok(safety::FetchResult {
+                    final_url: url.clone(),
+                    title: "Home".into(),
+                    text: text.clone(),
+                    links: vec![],
+                    etag: None,
+                    modified_at: None,
+                    technologies: vec![],
+                }),
+                None => Err(AppError::Message(
+                    "Source returned HTTP 404 Not Found.".into(),
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rescore_reuses_candidates_and_cached_pages_without_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let pages = [
+            ("Barton Taqueria", "Barton Taqueria serves tacos at three Austin locations.\nWe're hiring servers and line cooks now.\nFlexible shifts and weekly pay for every team member.\nEmail hello@bartontaqueria.example"),
+            ("Quiet Cafe", "A quiet cafe run by two owners on Cesar Chavez.\nWe are not hiring at this time.\nEmail hello@quietcafe.example"),
+        ];
+        let domain = |name: &str| format!("{}.example", name.to_ascii_lowercase().replace(' ', ""));
+        let sites = Arc::new(Sites {
+            homepages: pages
+                .iter()
+                .map(|(name, text)| (format!("https://{}/", domain(name)), text.to_string()))
+                .collect(),
+            requests: AtomicUsize::new(0),
+        });
+        let state = AppState {
+            database: Arc::new(Mutex::new(
+                db::open(&directory.path().join("rescore.sqlite3")).unwrap(),
+            )),
+            client: build_client().unwrap(),
+            app_data_dir: directory.path().to_path_buf(),
+            robots: Arc::default(),
+            fetcher: sites.clone(),
+        };
+        let mut brief = ai::interpret_search_brief(
+            "I sell payroll and shift scheduling software to restaurants with hourly staff",
+            None,
+            "Austin, TX",
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+        brief.approved = true;
+
+        // A first run discovers and researches both candidates.
+        let first = db::create_search_run(&state.connection().unwrap(), &brief).unwrap();
+        for (index, (name, _)) in pages.iter().enumerate() {
+            let result = DiscoveryResult {
+                source: "OpenStreetMap".into(),
+                company_name: (*name).into(),
+                domain: Some(domain(name)),
+                website_url: Some(format!("https://{}/", domain(name))),
+                external_id: None,
+                reason: "Mapped restaurant in the bounded Austin metro sample.".into(),
+                source_url: format!("https://www.openstreetmap.org/node/{index}"),
+                source_external_id: None,
+                business_phone: None,
+                location: Some("Austin metro, Texas, United States".into()),
+                identity_confidence: Some("medium".into()),
+            };
+            let account_id =
+                db::import_discovery_result(&mut state.connection().unwrap(), &first.id, &result)
+                    .unwrap();
+            process_search_candidate(&state, &first.id, &account_id, &brief)
+                .await
+                .unwrap();
+        }
+        db::finish_search_run(&state.connection().unwrap(), &first.id, "complete", None).unwrap();
+        let first_requests = sites.requests.load(Ordering::SeqCst);
+        assert!(first_requests > 0);
+
+        // The user marks a rule required and re-scores the same candidates.
+        let mut edited = brief.clone();
+        edited.id = "edited-brief".into();
+        edited.positive_signals[0].hard_gate = true;
+        let rescore = db::create_search_run(&state.connection().unwrap(), &edited).unwrap();
+        db::set_search_run_reuse(&state.connection().unwrap(), &rescore.id, &first.id).unwrap();
+        let sink: ProgressSink = Arc::new(|_| {});
+        execute_search_run(&state, &sink, &rescore.id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sites.requests.load(Ordering::SeqCst),
+            first_requests,
+            "the re-score made no network request"
+        );
+        let run = db::get_search_run(&state.connection().unwrap(), &rescore.id).unwrap();
+        assert_eq!(run.accounts.len(), 2);
+        let state_of = |name: &str| {
+            run.accounts
+                .iter()
+                .find(|item| item.account.name == name)
+                .map(|item| item.state.clone())
+                .unwrap()
+        };
+        assert_eq!(state_of("Barton Taqueria"), "qualified");
+        assert_ne!(state_of("Quiet Cafe"), "qualified");
+        assert!(run
+            .rule_health
+            .iter()
+            .any(|rate| rate.rule_id == edited.positive_signals[0].id && rate.assessed == 2));
     }
 }

@@ -34,14 +34,14 @@ pub trait Fetcher: Send + Sync {
     async fn fetch(&self, url: Url) -> AppResult<FetchResult>;
 }
 
-pub struct PublicFetcher<'a> {
-    pub client: &'a Client,
+pub struct PublicFetcher {
+    pub client: Client,
 }
 
 #[async_trait]
-impl Fetcher for PublicFetcher<'_> {
+impl Fetcher for PublicFetcher {
     async fn fetch(&self, url: Url) -> AppResult<FetchResult> {
-        fetch_public(self.client, url).await
+        fetch_public(&self.client, url).await
     }
 }
 
@@ -89,6 +89,27 @@ const PAGE_SLUGS: &[&str] = &[
     "patients",
     "order",
 ];
+
+/// A failure that will not change on retry within the cache window: the page
+/// does not exist, is forbidden, or is not a readable document.
+fn is_definitive_miss(error: &AppError) -> bool {
+    let message = error.to_string();
+    message.starts_with("Source returned HTTP 4")
+        || message.starts_with("Unsafe or unsupported content type")
+}
+
+/// The cached stand-in for a definitive miss. Its empty text yields no facts.
+fn empty_page(url: &Url) -> FetchResult {
+    FetchResult {
+        final_url: url.clone(),
+        title: String::new(),
+        text: String::new(),
+        links: Vec::new(),
+        etag: None,
+        modified_at: None,
+        technologies: Vec::new(),
+    }
+}
 
 /// How long a robots file may take before it is treated as absent.
 const ROBOTS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -140,9 +161,21 @@ impl Crawl<'_> {
         let left = self
             .remaining()
             .ok_or_else(|| AppError::Message("Public research reached its time budget.".into()))?;
-        let page = tokio::time::timeout(left, self.fetcher.fetch(url.clone()))
+        let fetched = tokio::time::timeout(left, self.fetcher.fetch(url.clone()))
             .await
-            .map_err(|_| AppError::Message("Public research reached its time budget.".into()))??;
+            .map_err(|_| AppError::Message("Public research reached its time budget.".into()))?;
+        let page = match fetched {
+            Ok(page) => page,
+            Err(error) => {
+                // A missing page is as cacheable as a present one: without
+                // this, every re-score re-requested each guessed path that
+                // 404'd the first time. Transient failures are not cached.
+                if is_definitive_miss(&error) {
+                    self.cache.store_page(account_id, url, &empty_page(url));
+                }
+                return Err(error);
+            }
+        };
         self.cache.store_page(account_id, url, &page);
         Ok((page, true))
     }

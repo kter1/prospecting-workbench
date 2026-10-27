@@ -46,8 +46,9 @@ export const api = {
     isDesktopRuntime
       ? invoke<SignalSuggestions>("suggest_signal_rules", { query, segmentLabels, existing })
       : Promise.resolve<SignalSuggestions>({ rules: [], message: "Browser preview; launch the desktop app for local-model suggestions." }),
-  startSearchRun: (brief: SearchBrief) =>
-    isDesktopRuntime ? invoke<SearchRun>("start_search_run", { brief }) : Promise.resolve<SearchRun>({ id: crypto.randomUUID(), query: brief.query, briefId: brief.id, status: "complete", progressCompleted: 0, progressTotal: 0, progressPercent: 100, progressStage: "Complete", resultLimit: brief.resultLimit, candidateCount: 0, researchedCount: 0, strongCount: 0, nearMatchCount: 0, warnings: [], startedAt: new Date().toISOString(), completedAt: new Date().toISOString(), accounts: [] }),
+  startSearchRun: (brief: SearchBrief, reuseCandidatesFrom?: string) =>
+    isDesktopRuntime ? invoke<SearchRun>("start_search_run", { brief, reuseCandidatesFrom: reuseCandidatesFrom ?? null }) : Promise.resolve<SearchRun>({ id: crypto.randomUUID(), query: brief.query, briefId: brief.id, status: "complete", progressCompleted: 0, progressTotal: 0, progressPercent: 100, progressStage: "Complete", resultLimit: brief.resultLimit, candidateCount: 0, researchedCount: 0, strongCount: 0, nearMatchCount: 0, warnings: [], startedAt: new Date().toISOString(), completedAt: new Date().toISOString(), accounts: [] }),
+  getSearchBrief: (briefId: string) => invoke<SearchBrief>("get_search_brief", { briefId }),
   listSearchRuns: () => isDesktopRuntime ? invoke<SearchRunSummary[]>("list_search_runs") : Promise.resolve([]),
   getSearchRun: (runId: string) => invoke<SearchRun>("get_search_run", { runId }),
   cancelSearchRun: (runId: string) => invoke<SearchRun>("cancel_search_run", { runId }),

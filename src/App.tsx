@@ -434,10 +434,10 @@ function App() {
             activeRun={activeRun}
             busy={busy}
             onInterpret={(query, geography, resultLimit, productWebsite) => api.interpretProspectingQuery(query, geography, resultLimit, productWebsite)}
-            onStart={(brief) => withBusy("search-run", async () => {
-              const run = await api.startSearchRun(brief);
+            onStart={(brief, reuseFrom) => withBusy("search-run", async () => {
+              const run = await api.startSearchRun(brief, reuseFrom);
               setActiveRun(run);
-              setNotice("Discovery started. Evidence-backed candidates will appear progressively.");
+              setNotice(reuseFrom ? "Re-scoring the earlier candidates with your edited signals." : "Discovery started. Evidence-backed candidates will appear progressively.");
             })}
             onCancel={() => activeRun && withBusy("cancel-run", async () => setActiveRun(await api.cancelSearchRun(activeRun.id)))}
             onClearRun={() => { setActiveRun(undefined); setNotice(undefined); setError(undefined); }}
@@ -561,13 +561,32 @@ function SalesPlayEditor({ initial, busy, proposing, onPropose, onSave }: { init
   );
 }
 
+/** Up to three signal rules a candidate matched, each with its source count. */
+function ruleChips(item: SearchRun["accounts"][number]) {
+  const signals = item.matchedFeatures.filter((feature) => feature.component === "signal" && feature.evidenceIds.length > 0);
+  if (!signals.length) return null;
+  return <div className="rule-chips">{signals.slice(0, 3).map((feature) => <span className="chip" key={feature.ruleId} title={`${feature.evidenceIds.length} quoted source${feature.evidenceIds.length === 1 ? "" : "s"}; open the candidate to read them`}>{feature.label}</span>)}{signals.length > 3 && <span className="chip muted-chip">+{signals.length - 3}</span>}</div>;
+}
+
+const RULE_VERDICT: Record<string, string> = {
+  not_discriminating: "fired on almost every candidate, so it is not telling them apart",
+  never_found: "was found nowhere; its keywords may not match how these sites write"
+};
+
+/** Rules that are not doing their job in this run, so the user can fix them. */
+function RuleHealth({ rates }: { rates: NonNullable<SearchRun["ruleHealth"]> }) {
+  const flagged = rates.filter((rate) => RULE_VERDICT[rate.verdict]);
+  if (!flagged.length) return null;
+  return <div className="rule-health" role="note"><strong>Signals to review</strong><ul>{flagged.map((rate) => <li key={rate.ruleId}><b>{rate.label}</b> ({rate.hits} of {rate.assessed}) {RULE_VERDICT[rate.verdict]}.</li>)}</ul><span>Use “Edit signals and re-score” to adjust them without searching again.</span></div>;
+}
+
 function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfirm, onInterpret, onStart, onCancel, onClearRun, onClearHistory, onOpenRun, onOpenAccount, onLibraryAction, onImport, onDiscover, onAddResults }: {
   capabilities: DashboardSnapshot["sourceCapabilities"];
   recentRuns: SearchRunSummary[];
   activeRun?: SearchRun;
   busy?: string;
   onInterpret: (query: string, geography: string, resultLimit: number, productWebsite?: string) => Promise<SearchBrief>;
-  onStart: (brief: SearchBrief) => Promise<void>;
+  onStart: (brief: SearchBrief, reuseCandidatesFrom?: string) => Promise<void>;
   onCancel: () => void;
   onClearRun: () => void;
   onClearHistory: () => void;
@@ -594,6 +613,7 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
   const [clock, setClock] = useState(Date.now());
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set());
   const [suggestionStatus, setSuggestionStatus] = useState<string>();
+  const [rescoreFrom, setRescoreFrom] = useState<{ runId: string; candidates: number }>();
   const planRef = useRef<HTMLElement>(null);
 
   // The plan compiles instantly and offline, and renders below the prompt. On a
@@ -665,6 +685,19 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
     }
   };
 
+  // Re-open the finished run's plan for editing, keeping its candidates.
+  const editAndRescore = async (finished: SearchRun) => {
+    try {
+      const previous = await api.getSearchBrief(finished.briefId);
+      setRescoreFrom({ runId: finished.id, candidates: finished.accounts.length });
+      setBrief({ ...previous, id: crypto.randomUUID(), approved: false });
+      setSelectedAccounts(new Set());
+      onClearRun();
+    } catch (reason) {
+      setLocalError(String(reason));
+    }
+  };
+
   const run = activeRun;
   const progress = searchProgress(run);
   const elapsedSeconds = run
@@ -690,7 +723,7 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
   const selectableAccounts = run?.status === "running" ? run.accounts : [...strongMatches, ...nearMatches];
   const candidateSection = (title: string, items: SearchRun["accounts"], tone: "success" | "warning" | "neutral" = "neutral") => items.length ? <section className="candidate-section"><div className="candidate-section-heading"><h3>{title}</h3><Badge tone={tone}>{items.length}</Badge></div><div className="candidate-grid">{items.map((item) => <article key={item.account.id} className="candidate-card">
     <div className="candidate-card-top"><button type="button" className={selectedAccounts.has(item.account.id) ? "avatar selector selected" : "avatar selector"} aria-pressed={selectedAccounts.has(item.account.id)} aria-label={`Select ${item.account.name}`} onClick={() => setSelectedAccounts((current) => { const next = new Set(current); next.has(item.account.id) ? next.delete(item.account.id) : next.add(item.account.id); return next; })}>{selectedAccounts.has(item.account.id) ? "✓" : item.account.name.slice(0, 2).toUpperCase()}</button><div className="badge-row"><Badge tone={item.resultTier === "strong" ? "success" : item.resultTier === "excluded" ? "danger" : "warning"}>{item.resultTier.replaceAll("_", " ")}</Badge><Badge>{item.discoverySource}</Badge></div></div>
-    <button type="button" className="candidate-body" onClick={() => onOpenAccount(item.account.id, run!.id)}><h3 title={item.account.name}>{item.account.name}</h3><p className="clamp-3" title={item.discoveryReason}>{item.discoveryReason}</p>{item.rejectionReasons[0] && <p className="candidate-caveat clamp-2" title={item.rejectionReasons[0]}>{item.rejectionReasons[0]}</p>}</button>
+    <button type="button" className="candidate-body" onClick={() => onOpenAccount(item.account.id, run!.id)}><h3 title={item.account.name}>{item.account.name}</h3><p className="clamp-3" title={item.discoveryReason}>{item.discoveryReason}</p>{ruleChips(item)}{item.rejectionReasons[0] && <p className="candidate-caveat clamp-2" title={item.rejectionReasons[0]}>{item.rejectionReasons[0]}</p>}</button>
     {safePublicWebsite(item.account.websiteUrl) && <button type="button" className="website-link" onClick={() => openExternal(safePublicWebsite(item.account.websiteUrl)!, setLocalError)}>Website ↗</button>}
     <div className="candidate-footer"><span><b>{item.score ?? "—"}</b> fit</span><span>Evidence: {item.evidenceConfidence}</span></div>
   </article>)}</div></section> : null;
@@ -717,11 +750,13 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
       <p className="receipt-summary">Looking for <strong>{brief.segments.map((item) => item.label).join(", ") || "organizations matching your description"}</strong> in <strong>{brief.geography}</strong>, and keeping up to <strong>{brief.resultLimit}</strong> that public evidence actually supports.</p>
       <div className="receipt-actions primary-first">
         {automatic
-          ? <button className="button primary" disabled={busy === "search-run"} onClick={() => void onStart({ ...brief, approved: true })}>{busy === "search-run" ? "Starting…" : `Start search for up to ${brief.resultLimit} matches`}</button>
+          ? <button className="button primary" disabled={busy === "search-run"} onClick={() => void onStart({ ...brief, approved: true }, rescoreFrom?.runId)}>{busy === "search-run" ? "Starting…" : rescoreFrom ? `Re-score ${rescoreFrom.candidates} candidates` : `Start search for up to ${brief.resultLimit} matches`}</button>
           : <strong className="blocked-reason">This plan cannot run automatically. See below.</strong>}
-        <button className="button ghost" onClick={() => setBrief(undefined)}>Edit the description</button>
+        <button className="button ghost" onClick={() => { setBrief(undefined); setRescoreFrom(undefined); }}>Edit the description</button>
       </div>
-      <p className="muted">Sources: {coverageLabel(brief)}. Searching visits public websites; reviewing this plan does not.</p>
+      {rescoreFrom
+        ? <p className="alert">Re-scoring the {rescoreFrom.candidates} candidates from your earlier search with these signals. Pages read in the last 24 hours are reused, so nothing is discovered or re-downloaded.</p>
+        : <p className="muted">Sources: {coverageLabel(brief)}. Searching visits public websites; reviewing this plan does not.</p>}
       <div className="receipt-grid">
         <div><span className="eyebrow">Outcome</span><p>{brief.customerOutcome}</p></div>
         <div><span className="eyebrow">Personas</span><div className="chip-row">{brief.targetPersonas.map((item) => <span className="chip" key={item}>{item}</span>)}</div></div>
@@ -744,9 +779,9 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
       {run.status === "running" && <button className="button ghost" disabled={busy === "cancel-run"} onClick={onCancel}>Cancel search</button>}
       {selectableAccounts.length > 0 && <button className="select-all result-select-all" onClick={() => setSelectedAccounts(selectedAccounts.size === selectableAccounts.length ? new Set() : new Set(selectableAccounts.map((item) => item.account.id)))}>{selectedAccounts.size === selectableAccounts.length ? "Clear visible selection" : "Select all visible matches"}</button>}
       {selectedAccounts.size > 0 && <div className="bulk-toolbar"><strong>{selectedAccounts.size} selected</strong><button onClick={() => onLibraryAction([...selectedAccounts], "save")}>Save</button><button onClick={() => onLibraryAction([...selectedAccounts], "favorite")}>Favorite</button><button className="danger-text" onClick={() => onLibraryAction([...selectedAccounts], "trash")}>Move to Trash</button><button onClick={() => setSelectedAccounts(new Set())}>Clear</button></div>}
-      {run.status === "running" ? candidateSection("Candidates being evaluated", run.accounts) : <><div className="result-summary"><strong>{run.strongCount} strong match{run.strongCount === 1 ? "" : "es"}</strong><span>Discovered {run.candidateCount} · Researched {run.researchedCount} · Requested up to {run.resultLimit}</span>{run.strongCount < run.resultLimit && <small>{shortfallExplanation(run)}</small>}</div>{candidateSection("Strong Matches", strongMatches, "success")}{candidateSection("Near Matches", nearMatches, "warning")}{excluded.length > 0 && <details className="excluded-results"><summary>Excluded or failed diagnostics ({excluded.length})</summary>{candidateSection("Excluded or Failed", excluded)}</details>}</>}
+      {run.status === "running" ? candidateSection("Candidates being evaluated", run.accounts) : <><div className="result-summary"><strong>{run.strongCount} strong match{run.strongCount === 1 ? "" : "es"}</strong><span>Discovered {run.candidateCount} · Researched {run.researchedCount} · Requested up to {run.resultLimit}</span>{run.strongCount < run.resultLimit && <small>{shortfallExplanation(run)}</small>}</div><RuleHealth rates={run.ruleHealth ?? []} />{candidateSection("Strong Matches", strongMatches, "success")}{candidateSection("Near Matches", nearMatches, "warning")}{excluded.length > 0 && <details className="excluded-results"><summary>Excluded or failed diagnostics ({excluded.length})</summary>{candidateSection("Excluded or Failed", excluded)}</details>}</>}
       {!run.accounts.length && run.status !== "running" && <p className="muted">No automatic candidates were returned. Use the guided or seeded routes; the workbench will not fill the list with unsupported matches.</p>}
-      {run.status !== "running" && <button className="button primary" onClick={() => { setBrief(undefined); setSelectedAccounts(new Set()); onClearRun(); }}>Start another search</button>}
+      {run.status !== "running" && <div className="receipt-actions"><button className="button primary" onClick={() => { setBrief(undefined); setRescoreFrom(undefined); setSelectedAccounts(new Set()); onClearRun(); }}>Start another search</button>{run.briefId && run.accounts.length > 0 && <button className="button secondary" onClick={() => void editAndRescore(run)}>Edit signals and re-score</button>}</div>}
     </section>}
 
     {!run && recentRuns.length > 0 && <section className="panel"><div className="section-heading"><div><h3>Recent searches</h3></div><button className="button ghost danger-text" onClick={() => requestConfirm({ title: "Clear search history?", body: `This removes all ${recentRuns.length} past searches and their cached results. Saved prospects are kept.`, confirmLabel: "Clear history", onConfirm: onClearHistory })}>Clear history</button></div><div className="recent-runs">{recentRuns.slice(0, 5).map((item) => <button key={item.id} onClick={() => void onOpenRun(item.id)}><span><strong>{item.query}</strong><small>{item.strongCount} strong · {item.qualifiedCount} qualified · {item.reviewCount} review</small></span><Badge>{item.status}</Badge></button>)}</div></section>}
