@@ -2,7 +2,7 @@
 
 A local-first desktop application for B2B prospect research. You describe what you sell in plain language; it finds U.S. companies that match, collects public evidence about each one, and will not state anything it cannot attribute to a source.
 
-The app compiles a search plan you can read and edit before anything runs. It then discovers candidates from free public sources, reads their public web pages, scores fit using fixed rules in application code, and drafts outreach with a local 9B model. Every factual sentence in a draft must quote a stored evidence row, or it is removed before you see it.
+The app compiles a search plan you can read and edit before anything runs, including the signals a good customer's own website would show. It then discovers candidates from free public sources, reads their public web pages, scores fit using those rules in application code, and drafts outreach with a local 9B model. Every factual sentence in a draft must quote a stored evidence row, or it is removed before you see it.
 
 Everything runs on your machine. There is no account, server, telemetry, paid data vendor, or hosted inference.
 
@@ -14,7 +14,7 @@ The obvious way to build this is to wrap a paid contact database and a chat mode
 
 The rule I worked to instead was that the application may only assert what it can cite, and must say so plainly when it finds nothing. Most of the design follows from that.
 
-Scoring lives in Rust rather than in the model. A model asked to produce a number can be argued into producing any number, so the weights are fixed at 35/30/20/15 and can be audited.
+Scoring lives in Rust rather than in the model. A model asked to produce a number can be argued into producing any number, so the weights are fixed at 35/30/20/15 and can be audited. The local model may suggest *rules* while you plan, before any company has been seen; it never sees a candidate's pages during qualification, and never sets a score.
 
 The model writes, but it does not assert. A second pass checks each drafted claim against evidence IDs, removes sentences it cannot support, and refuses a draft entirely if nothing cited survives.
 
@@ -28,11 +28,17 @@ Sources have to be free and rule-abiding. OpenStreetMap and Wikidata both publis
 
 **Compiling a plan.** A deterministic compiler turns your description into target segments, qualification signals, geography and named discovery lanes. It runs offline and returns immediately, and it lists the assumptions it made so you can correct them. Nothing touches the network until you approve the plan.
 
+Signals come from the product you describe, not from a fixed list. Curated packs cover payroll and scheduling, point of sale and ordering, marketing, ecommerce, IT and security, compliance, finance, recruiting, benefits, logistics, representation, and phone intake. Each pack lists what a *customer's* site would show if they needed that product: "now hiring servers" and "weekly pay" for payroll, "patient portal" and "insurance plans" for HIPAA compliance. If Ollama is running, the local model then suggests a few more. Every signal's keywords can be edited, a signal can be marked required, and signals can be added or removed before the search starts. When you describe what you sell ("payroll software *to restaurants*"), only the audience clause chooses the business type, so the product's own words do not target your competitors.
+
 **Discovery.** Two automatic lanes cover different shapes of company. OpenStreetMap handles businesses with a mapped physical premise, using a curated catalog of 94 verticals across all 50 states and roughly 50 metro areas. Wikidata handles organizations that have no storefront, such as agencies, studios and professional firms. A third optional lane uses a SearXNG instance you run yourself.
 
 ![A search running against public sources, streaming candidates as it goes](docs/screenshots/live-search.png)
 
-**Research and qualification.** Each candidate's public pages are crawled within the limits of its robots.txt, and focused excerpts become evidence rows. Fixed-weight scoring produces a fit score. Only candidates within four points of the best eligible score are promoted to Strong Match; the rest stay visible as near matches with their reasons attached.
+**Research and qualification.** Each candidate's public pages are crawled within the limits of its robots.txt. For every approved signal, the first line on the whole page that supports it is quoted as an evidence row, and about-and-team pages yield quoted evidence for target roles. Scripts, stylesheets and booking or ordering links in the page markup reveal about thirty technologies (Shopify, Calendly, Toast, ServiceTitan, HubSpot and others), which signals can cite and exclusions can use as competitor gates.
+
+One matcher decides both what the crawler quotes and what scoring credits. It compares whole words with light stemming, lets a phrase span a few words ("hiring experienced servers" supports "hiring servers"), and rejects negated lines ("we are not hiring"). Each sentence can support one signal at most, so a candidate qualifies on genuinely independent evidence: by default, two signals plus a way to contact the business. Only candidates within four points of the best eligible score are promoted to Strong Match. The rest stay visible as near matches, with the signals they did match shown on each card.
+
+After a run, signals that matched almost every candidate, or none, are flagged. "Edit signals and re-score" applies edited signals to the same candidates using pages read in the last 24 hours, so tuning a plan takes seconds and makes no new requests.
 
 **Drafting.** A pinned local `qwen3.5:9b` composes an email and call brief using Ollama's structured output. A separate pass re-checks every claim against the evidence. The compliance footer is built from the sender identity you approved. The application never sends anything.
 
@@ -48,6 +54,8 @@ Sources have to be free and rule-abiding. OpenStreetMap and Wikidata both publis
 
 *Testing.* Parser fixtures cover malformed, duplicate and injection-bearing payloads for every public source. Several tests encode measured behaviour of the live services, so a regression fails by name rather than vaguely.
 
+*Relevance evaluation.* [`eval_fixtures.rs`](src-tauri/src/eval_fixtures.rs) runs four requests (payroll for restaurants, HIPAA compliance for dentists, a screenwriter seeking an agent, and voice intake for plumbers) against a hand-labelled set of realistic company pages through the real planner, extraction and scoring. A floor test holds precision at 1.00 and recall at 0.66 or better. Each corpus includes near-misses that fooled earlier versions, such as "avocado toast", "we are not hiring" and "homeowners". These pages were written alongside the rules, so they measure the mechanism rather than real-world yield. `scripts/live-search-eval.sh` runs the full pipeline against the live sources and reports yield, rule hit rates and quoted reasons for the top matches.
+
 ## Architecture
 
 ```
@@ -59,7 +67,10 @@ Rust core
   |-- adapters.rs               OpenStreetMap, SEC, USAspending, SearXNG
   |-- wikidata.rs               open-ended organization discovery
   |-- safety.rs                 fetch policy, SSRF defence, sanitisation
-  |-- research.rs               bounded crawl, evidence extraction
+  |-- research.rs               deadline-bounded crawl, page cache, evidence
+  |-- signals.rs                product signal packs, rule sanitizing
+  |-- matcher.rs                shared stemmed, negation-aware matcher
+  |-- technology.rs             website technology fingerprints
   |-- qualification.rs          fixed-weight scoring, hard gates
   |-- ai.rs                     Ollama structured output, verification
   |-- db.rs                     SQLite, migrations, serialized writes
@@ -68,7 +79,7 @@ Rust core
 SQLite (app data dir)      Ollama @ 127.0.0.1:11434
 ```
 
-Roughly 11k lines of Rust and 1.6k of TypeScript, with 104 tests. CI runs both test suites, a production build, `cargo fmt --check` and `clippy -D warnings`, and generates an SPDX SBOM.
+Roughly 14.5k lines of Rust and 1.9k of TypeScript, with 149 tests. CI runs both test suites, a production build, `cargo fmt --check` and `clippy -D warnings`, and generates an SPDX SBOM.
 
 ## Requirements and setup
 
@@ -91,6 +102,6 @@ The application does not send email, place calls, guess addresses, scrape Linked
 
 ## Project status
 
-Working end to end on macOS. Outstanding work includes pagination in the run view for very large result sets, per-request discovery caching, and widening the qualification signal vocabulary beyond local service trades. A talent agency's website does not advertise "24/7 emergency service," so the scoring layer currently under-serves verticals that the discovery layer can now reach.
+Working end to end on macOS. Outstanding work includes pagination in the run view for very large result sets, learning from the prospects you accept or reject, and discovery sources for mid-sized companies that are neither mapped nor notable. Signal packs are hand-written, so a product outside them relies on local-model suggestions and your own edits; the evaluation corpus is small and self-authored, and the live evaluation is the better measure of real yield.
 
 See [SECURITY.md](SECURITY.md) for the threat model and [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions. Licensed under Apache-2.0.
