@@ -404,10 +404,13 @@ pub(crate) fn extract_facts(
             "rule_excerpt",
             rule.label.clone(),
             excerpt_around(&lines, index),
+            // Only hiring is a reason to reach out now. Other rule excerpts are
+            // evidence for their rule and are shown there; repeating them as
+            // uncategorised "signals" listed one sentence several times.
             if rule.id.contains("hiring") {
                 "hiring"
             } else {
-                "other"
+                ""
             },
         ));
     }

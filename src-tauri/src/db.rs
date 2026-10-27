@@ -832,6 +832,20 @@ pub fn add_signal(
     evidence_id: &str,
     confidence: &str,
 ) -> AppResult<()> {
+    // A careers page yields its opening text and, separately, the hiring line
+    // inside it. Keep one: skip a summary that repeats, or is repeated by, a
+    // signal already stored for this account and category.
+    let summary_key = crate::matcher::normalized(summary);
+    let mut statement =
+        connection.prepare("SELECT summary FROM signals WHERE account_id=?1 AND category=?2")?;
+    let repeats = statement
+        .query_map(params![account_id, category], |row| row.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .map(|existing| crate::matcher::normalized(&existing))
+        .any(|existing| existing.contains(&summary_key) || summary_key.contains(&existing));
+    if repeats {
+        return Ok(());
+    }
     connection.execute(
         "INSERT OR IGNORE INTO signals(id,account_id,category,summary,evidence_id,confidence)
          VALUES(?1,?2,?3,?4,?5,?6)",
@@ -3455,5 +3469,57 @@ mod tests {
             rule_hit_rates(&[rule("some")], &accounts[..3])[0].verdict,
             "too_few"
         );
+    }
+
+    #[test]
+    fn a_signal_repeated_inside_another_is_stored_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = open(&directory.path().join("signals.sqlite3")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO accounts(id,name,status,created_at,updated_at) VALUES('a','Acme','new',?1,?1)",
+                params![now()],
+            )
+            .unwrap();
+        for (id, excerpt) in [("e1", "page"), ("e2", "line")] {
+            connection
+                .execute(
+                    "INSERT INTO evidence(id,account_id,source_url,source_kind,title,excerpt,retrieved_at,content_hash,confidence,freshness)
+                     VALUES(?1,'a','https://acme.example/careers','careers_page','Careers',?2,?3,?1,'high','fresh')",
+                    params![id, excerpt, now()],
+                )
+                .unwrap();
+        }
+        let page = "We're hiring servers and line cooks. Flexible shifts and weekly pay.";
+        add_signal(&connection, "a", "hiring", page, "e1", "medium").unwrap();
+        add_signal(
+            &connection,
+            "a",
+            "hiring",
+            "We're hiring servers and line cooks.",
+            "e2",
+            "high",
+        )
+        .unwrap();
+        add_signal(
+            &connection,
+            "a",
+            "funding",
+            "We're hiring servers and line cooks.",
+            "e2",
+            "high",
+        )
+        .unwrap();
+        let count = |category: &str| -> i64 {
+            connection
+                .query_row(
+                    "SELECT count(*) FROM signals WHERE category=?1",
+                    params![category],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("hiring"), 1);
+        assert_eq!(count("funding"), 1, "other categories are independent");
     }
 }
