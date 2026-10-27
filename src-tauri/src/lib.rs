@@ -3,6 +3,8 @@ mod ai;
 mod catalog;
 mod db;
 mod error;
+#[cfg(test)]
+mod eval_fixtures;
 mod models;
 mod qualification;
 mod regions;
@@ -28,6 +30,17 @@ struct AppState {
     database: Arc<Mutex<Connection>>,
     client: Client,
     app_data_dir: PathBuf,
+}
+
+/// Where search-run progress goes. The desktop app emits it to the window;
+/// headless evaluation records it. Searching never needs the window itself.
+type ProgressSink = Arc<dyn Fn(&SearchRunProgress) + Send + Sync>;
+
+fn window_progress_sink(app: &AppHandle) -> ProgressSink {
+    let app = app.clone();
+    Arc::new(move |progress| {
+        let _ = app.emit("search-run-progress", progress);
+    })
 }
 
 impl AppState {
@@ -159,12 +172,13 @@ async fn start_search_run(
     let background = state.inner().clone();
     let run_id = run.id.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = execute_search_run(&background, &app, &run_id).await {
+        let sink = window_progress_sink(&app);
+        if let Err(error) = execute_search_run(&background, &sink, &run_id).await {
             if let Ok(connection) = background.connection() {
                 let _ =
                     db::finish_search_run(&connection, &run_id, "failed", Some(&error.to_string()));
             }
-            let _ = publish_search_finished(&background, &app, &run_id);
+            let _ = publish_search_finished(&background, &sink, &run_id);
         }
     });
     Ok(run)
@@ -867,7 +881,7 @@ async fn process_search_candidate(
 /// per tick at high candidate targets. The UI pages accounts in separately.
 fn publish_search_progress(
     state: &AppState,
-    app: &AppHandle,
+    sink: &ProgressSink,
     run_id: &str,
     percent: i64,
     stage: &str,
@@ -877,14 +891,14 @@ fn publish_search_progress(
         db::set_search_run_stage(&connection, run_id, percent, stage)?;
         db::get_search_run_progress(&connection, run_id)?
     };
-    let _ = app.emit("search-run-progress", progress);
+    sink(&progress);
     Ok(())
 }
 
 /// Emit the terminal tick for a run that has reached a final state.
-fn publish_search_finished(state: &AppState, app: &AppHandle, run_id: &str) -> AppResult<()> {
+fn publish_search_finished(state: &AppState, sink: &ProgressSink, run_id: &str) -> AppResult<()> {
     let progress = db::get_search_run_progress(&*state.connection()?, run_id)?;
-    let _ = app.emit("search-run-progress", progress);
+    sink(&progress);
     Ok(())
 }
 
@@ -988,13 +1002,13 @@ async fn resolve_and_discover_reference_data(
     wikidata::discover_instances(&state.client, &classes, limit, offset).await
 }
 
-async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> AppResult<()> {
+async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str) -> AppResult<()> {
     let brief = {
         let connection = state.connection()?;
         let run = db::get_search_run(&connection, run_id)?;
         db::get_search_brief(&connection, &run.brief_id)?
     };
-    publish_search_progress(state, app, run_id, 2, "Preparing enabled sources")?;
+    publish_search_progress(state, sink, run_id, 2, "Preparing enabled sources")?;
     let candidate_budget = (brief.result_limit * 5).max(30).clamp(1, 100) as usize;
     // Shifts which bounded regions this run samples first. Without it, repeat
     // searches re-sample one bounding box and return the same companies.
@@ -1010,7 +1024,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         let lane_start = 5 + (lane_index as i64 * 20 / lane_total);
         publish_search_progress(
             state,
-            app,
+            sink,
             run_id,
             lane_start,
             &format!("Searching {}", lane.label),
@@ -1229,7 +1243,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         }
         publish_search_progress(
             state,
-            app,
+            sink,
             run_id,
             5 + ((lane_index as i64 + 1) * 20 / lane_total),
             &format!("Finished {}", lane.label),
@@ -1257,7 +1271,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
     results.truncate(candidate_budget);
     publish_search_progress(
         state,
-        app,
+        sink,
         run_id,
         30,
         &format!("Found {} candidate records", results.len()),
@@ -1300,7 +1314,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
     db::set_search_run_progress(&*state.connection()?, run_id, 0, total)?;
     publish_search_progress(
         state,
-        app,
+        sink,
         run_id,
         40,
         if total == 0 {
@@ -1391,7 +1405,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
             db::set_search_run_counts(&*state.connection()?, run_id, total, completed)?;
             publish_search_progress(
                 state,
-                app,
+                sink,
                 run_id,
                 40 + (completed * 55 / total.max(1)),
                 &format!("Researched {completed} of {total} discovered candidates"),
@@ -1422,7 +1436,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         return Ok(());
     }
     db::set_search_run_progress(&*state.connection()?, run_id, completed, total)?;
-    publish_search_progress(state, app, run_id, 98, "Finalizing ranked results")?;
+    publish_search_progress(state, sink, run_id, 98, "Finalizing ranked results")?;
     db::finalize_search_ranking(
         &*state.connection()?,
         run_id,
@@ -1450,7 +1464,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         )?;
     }
     db::finish_search_run(&*state.connection()?, run_id, "complete", None)?;
-    publish_search_finished(state, app, run_id)?;
+    publish_search_finished(state, sink, run_id)?;
     Ok(())
 }
 
@@ -1538,6 +1552,15 @@ fn search_budget(result_limit: i64) -> Duration {
     Duration::from_secs((45 + result_limit.max(0) * 3).clamp(45, 240) as u64)
 }
 
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .user_agent("ProspectingWorkbenchBot/0.1 (+local desktop research; respects robots.txt)")
+        .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
+        .build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1557,14 +1580,7 @@ pub fn run() {
                     Some("Interrupted because a newer search was active."),
                 )?;
             }
-            let client = Client::builder()
-                .user_agent(
-                    "ProspectingWorkbenchBot/0.1 (+local desktop research; respects robots.txt)",
-                )
-                .redirect(Policy::none())
-                .connect_timeout(Duration::from_secs(8))
-                .timeout(Duration::from_secs(20))
-                .build()?;
+            let client = build_client()?;
             let state = AppState {
                 database: Arc::new(Mutex::new(connection)),
                 client,
@@ -1581,8 +1597,8 @@ pub fn run() {
             });
             tauri::async_runtime::spawn(async move {
                 if let Some(run_id) = resumable_search {
-                    if let Err(error) =
-                        execute_search_run(&search_background, &search_app, &run_id).await
+                    let sink = window_progress_sink(&search_app);
+                    if let Err(error) = execute_search_run(&search_background, &sink, &run_id).await
                     {
                         if let Ok(connection) = search_background.connection() {
                             let _ = db::finish_search_run(
@@ -1754,5 +1770,132 @@ mod command_policy_tests {
         // "in", "the" and similar must never earn relevance points.
         let noise = discovery("Generic Co", "in the of and", false);
         assert_eq!(relevance_score(&noise, &brief), 0);
+    }
+}
+
+/// Live yield evaluation against the real public sources.
+///
+/// Ignored by default: it needs network access and takes minutes. Run it with
+/// `scripts/live-search-eval.sh`, before and after a change, and compare.
+#[cfg(test)]
+mod live_eval {
+    use super::*;
+
+    const BRIEFS: &[(&str, &str)] = &[
+        (
+            "I sell payroll and shift scheduling software to restaurants with hourly staff",
+            "Austin, TX",
+        ),
+        (
+            "We sell HIPAA compliance and patient data security software to dental practices",
+            "Pennsylvania",
+        ),
+        (
+            "I am a screenwriter with a pilot script looking for literary representation",
+            "United States",
+        ),
+    ];
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_search_yield_eval() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            database: Arc::new(Mutex::new(
+                db::open(&directory.path().join("eval.sqlite3")).unwrap(),
+            )),
+            client: build_client().unwrap(),
+            app_data_dir: directory.path().to_path_buf(),
+        };
+        let sink: ProgressSink = Arc::new(|_| {});
+        for (query, geography) in BRIEFS {
+            let mut brief = ai::interpret_search_brief(query, None, geography, 10, None)
+                .await
+                .unwrap();
+            brief.approved = true;
+            let run = db::create_search_run(&state.connection().unwrap(), &brief).unwrap();
+            let started = std::time::Instant::now();
+            let outcome = execute_search_run(&state, &sink, &run.id).await;
+            let elapsed = started.elapsed().as_secs();
+            let run = db::get_search_run(&state.connection().unwrap(), &run.id).unwrap();
+            println!("\n=== {query} ({geography})");
+            if let Err(error) = outcome {
+                println!("run error: {error}");
+            }
+            for warning in &run.warnings {
+                println!("warning [{}]: {}", warning.source, warning.message);
+            }
+            let researched = run
+                .accounts
+                .iter()
+                .filter(|item| !matches!(item.state.as_str(), "screening" | "researching"))
+                .collect::<Vec<_>>();
+            let with_evidence = researched
+                .iter()
+                .filter(|item| {
+                    db::get_package(&state.connection().unwrap(), &item.account.id)
+                        .map(|package| {
+                            package
+                                .evidence
+                                .iter()
+                                .any(|evidence| !evidence.source_kind.ends_with("_record"))
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            println!(
+                "wall {elapsed}s · found {} · researched {} · with page evidence {with_evidence} · strong {} · near {}",
+                run.candidate_count,
+                researched.len(),
+                run.strong_count,
+                run.near_match_count
+            );
+            for rule in &brief.positive_signals {
+                let hits = researched
+                    .iter()
+                    .filter(|item| {
+                        item.matched_features
+                            .iter()
+                            .any(|feature| feature.rule_id == rule.id)
+                    })
+                    .count();
+                println!(
+                    "rule {:<28} hit {hits}/{}",
+                    rule.id,
+                    researched.len().max(1)
+                );
+            }
+            let mut ranked = run
+                .accounts
+                .iter()
+                .filter(|item| item.result_tier != "excluded")
+                .collect::<Vec<_>>();
+            ranked.sort_by_key(|item| item.rank.unwrap_or(i64::MAX));
+            for item in ranked.iter().take(5) {
+                println!(
+                    "  #{} {} [{}] score {} · {}",
+                    item.rank.unwrap_or_default(),
+                    item.account.name,
+                    item.result_tier,
+                    item.score.unwrap_or_default(),
+                    item.account.website_url.as_deref().unwrap_or("no website")
+                );
+                let package =
+                    db::get_package(&state.connection().unwrap(), &item.account.id).unwrap();
+                for feature in item
+                    .matched_features
+                    .iter()
+                    .filter(|feature| feature.component == "signal")
+                {
+                    let quote = package
+                        .evidence
+                        .iter()
+                        .find(|evidence| feature.evidence_ids.contains(&evidence.id))
+                        .map(|evidence| evidence.excerpt.chars().take(140).collect::<String>())
+                        .unwrap_or_default();
+                    println!("      {}: \"{quote}\"", feature.label);
+                }
+            }
+        }
     }
 }
