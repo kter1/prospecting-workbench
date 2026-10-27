@@ -5,6 +5,7 @@ mod db;
 mod error;
 #[cfg(test)]
 mod eval_fixtures;
+mod matcher;
 mod models;
 mod qualification;
 mod regions;

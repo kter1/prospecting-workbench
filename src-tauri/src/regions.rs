@@ -193,6 +193,50 @@ fn nationwide(rotation: usize) -> Vec<BoundedRegion> {
         .collect()
 }
 
+/// Where a piece of text places something: a metro when one is named, and
+/// always the state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Place {
+    pub metro: Option<&'static str>,
+    pub state: &'static str,
+}
+
+/// Locate free text such as "Austin, TX" or "Philadelphia metro, Pennsylvania,
+/// United States" to a metro and state, using the same rules as `resolve`.
+/// `None` for text that names no state, including "United States" on its own.
+pub fn place(text: &str) -> Option<Place> {
+    let normalized = normalize(text);
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some(metro) = METROS.iter().find(|entry| {
+        contains_word(&normalized, &normalize(entry.label))
+            || entry
+                .aliases
+                .iter()
+                .any(|alias| contains_word(&normalized, alias))
+    }) {
+        let state = STATES.iter().find(|entry| {
+            metro
+                .location
+                .ends_with(&format!(", {}, United States", entry.display))
+        })?;
+        return Some(Place {
+            metro: Some(metro.label),
+            state: state.display,
+        });
+    }
+    let last_token = normalized.split(' ').next_back().unwrap_or_default();
+    STATES
+        .iter()
+        .filter(|entry| contains_word(&normalized, entry.name) || last_token == entry.code)
+        .max_by_key(|entry| entry.name.len())
+        .map(|entry| Place {
+            metro: None,
+            state: entry.display,
+        })
+}
+
 /// Resolve a user-supplied geography into bounded sampling regions.
 ///
 /// `rotation` shifts which metros a nationwide or statewide search visits
@@ -298,6 +342,33 @@ mod tests {
         assert_eq!(resolve("TX", 0).last().unwrap().label, "Texas");
         assert_eq!(resolve("United States", 0).len(), NATIONWIDE_SAMPLE);
         assert!(resolve("Everywhere on earth", 0).is_empty());
+    }
+
+    #[test]
+    fn places_free_text_at_metro_and_state() {
+        assert_eq!(
+            place("Austin, TX"),
+            Some(Place {
+                metro: Some("Austin metro"),
+                state: "Texas"
+            })
+        );
+        assert_eq!(
+            place("Philadelphia metro, Pennsylvania, United States").map(|p| p.state),
+            Some("Pennsylvania")
+        );
+        assert_eq!(
+            place("Haddonfield, New Jersey, United States"),
+            Some(Place {
+                metro: None,
+                state: "New Jersey"
+            })
+        );
+        assert_eq!(
+            place("West Virginia").map(|p| p.state),
+            Some("West Virginia")
+        );
+        assert_eq!(place("United States"), None);
         assert!(resolve("Paris, France", 0).is_empty());
     }
 

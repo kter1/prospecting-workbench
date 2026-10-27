@@ -751,7 +751,7 @@ fn signal_template(id: &str) -> Option<QualificationRule> {
         ),
         "multiple_locations" => (
             "Multiple locations or service areas",
-            vec!["locations", "service areas", "areas we serve"],
+            vec!["\"locations\"", "service areas", "areas we serve"],
             25,
             "icp",
         ),
