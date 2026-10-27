@@ -6,7 +6,9 @@ The app compiles a search plan you can read and edit before anything runs, inclu
 
 Everything runs on your machine. There is no account, server, telemetry, paid data vendor, or hosted inference.
 
-![A qualified prospect with its fit score, matched features and evidence count](docs/screenshots/qualification.png)
+![A qualified prospect with its fit score, matched signals and contact route](docs/screenshots/prospect.png)
+
+*Screenshots show the bundled evaluation corpus. The restaurants are fictional; every score, signal and quote is the application's own output for their pages.*
 
 ## Design constraints
 
@@ -30,15 +32,17 @@ Sources have to be free and rule-abiding. OpenStreetMap and Wikidata both publis
 
 Signals come from the product you describe, not from a fixed list. Curated packs cover payroll and scheduling, point of sale and ordering, marketing, ecommerce, IT and security, compliance, finance, recruiting, benefits, logistics, representation, and phone intake. Each pack lists what a *customer's* site would show if they needed that product: "now hiring servers" and "weekly pay" for payroll, "patient portal" and "insurance plans" for HIPAA compliance. If Ollama is running, the local model then suggests a few more. Every signal's keywords can be edited, a signal can be marked required, and signals can be added or removed before the search starts. When you describe what you sell ("payroll software *to restaurants*"), only the audience clause chooses the business type, so the product's own words do not target your competitors.
 
-**Discovery.** Two automatic lanes cover different shapes of company. OpenStreetMap handles businesses with a mapped physical premise, using a curated catalog of 94 verticals across all 50 states and roughly 50 metro areas. Wikidata handles organizations that have no storefront, such as agencies, studios and professional firms. A third optional lane uses a SearXNG instance you run yourself.
+![A search plan for payroll software, with editable signals drawn from the payroll pack](docs/screenshots/plan.png)
 
-![A search running against public sources, streaming candidates as it goes](docs/screenshots/live-search.png)
+**Discovery.** Two automatic lanes cover different shapes of company. OpenStreetMap handles businesses with a mapped physical premise, using a curated catalog of 94 verticals across all 50 states and roughly 50 metro areas. Wikidata handles organizations that have no storefront, such as agencies, studios and professional firms. A third optional lane uses a SearXNG instance you run yourself.
 
 **Research and qualification.** Each candidate's public pages are crawled within the limits of its robots.txt. For every approved signal, the first line on the whole page that supports it is quoted as an evidence row, and about-and-team pages yield quoted evidence for target roles. Scripts, stylesheets and booking or ordering links in the page markup reveal about thirty technologies (Shopify, Calendly, Toast, ServiceTitan, HubSpot and others), which signals can cite and exclusions can use as competitor gates.
 
 One matcher decides both what the crawler quotes and what scoring credits. It compares whole words with light stemming, lets a phrase span a few words ("hiring experienced servers" supports "hiring servers"), and rejects negated lines ("we are not hiring"). Each sentence can support one signal at most, so a candidate qualifies on genuinely independent evidence: by default, two signals plus a way to contact the business. Only candidates within four points of the best eligible score are promoted to Strong Match. The rest stay visible as near matches, with the signals they did match shown on each card.
 
 After a run, signals that matched almost every candidate, or none, are flagged. "Edit signals and re-score" applies edited signals to the same candidates using pages read in the last 24 hours, so tuning a plan takes seconds and makes no new requests.
+
+![Strong matches with the signals each one met, and a signal flagged because no candidate showed it](docs/screenshots/results.png)
 
 **Drafting.** A pinned local `qwen3.5:9b` composes an email and call brief using Ollama's structured output. A separate pass re-checks every claim against the evidence. The compliance footer is built from the sender identity you approved. The application never sends anything.
 
