@@ -69,6 +69,15 @@ export interface QualificationRule {
   keywords: string[];
   points: number;
   hardGate: boolean;
+  /** Where the rule came from. Older stored briefs have none. */
+  origin?: RuleOrigin;
+}
+
+export type RuleOrigin = "catalog" | "pack" | "model" | "query" | "user" | "";
+
+export interface SignalSuggestions {
+  rules: QualificationRule[];
+  message: string;
 }
 
 export interface DiscoveryLane {
@@ -154,7 +163,17 @@ export interface SearchRun {
   startedAt: string;
   completedAt?: string;
   lastError?: string;
+  /** How often each plan rule fired across the assessed candidates. */
+  ruleHealth?: RuleHitRate[];
   accounts: SearchRunAccount[];
+}
+
+export interface RuleHitRate {
+  ruleId: string;
+  label: string;
+  hits: number;
+  assessed: number;
+  verdict: "ok" | "too_few" | "never_found" | "not_discriminating";
 }
 
 export type SearchRunStatus = "running" | "complete" | "failed" | "cancelled";

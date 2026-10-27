@@ -174,7 +174,7 @@ fn singularize(token: &str) -> &str {
     }
 }
 
-fn normalize(value: &str) -> String {
+pub(crate) fn normalize(value: &str) -> String {
     value
         .to_ascii_lowercase()
         .chars()
@@ -192,7 +192,7 @@ fn normalize(value: &str) -> String {
         .join(" ")
 }
 
-fn contains_word(haystack: &str, needle: &str) -> bool {
+pub(crate) fn contains_word(haystack: &str, needle: &str) -> bool {
     let needle = normalize(needle);
     !needle.is_empty() && format!(" {haystack} ").contains(&format!(" {needle} "))
 }

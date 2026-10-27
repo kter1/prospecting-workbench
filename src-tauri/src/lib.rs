@@ -1,18 +1,24 @@
 mod adapters;
-mod ai;
 mod catalog;
 mod db;
 mod error;
+#[cfg(test)]
+mod eval_fixtures;
+mod local_model;
+mod matcher;
 mod models;
 mod qualification;
 mod regions;
 mod research;
 mod safety;
+mod signals;
+mod technology;
 mod wikidata;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::redirect::Policy;
 use reqwest::Client;
@@ -28,6 +34,53 @@ struct AppState {
     database: Arc<Mutex<Connection>>,
     client: Client,
     app_data_dir: PathBuf,
+    /// Parsed robots files by host, kept in memory for a day. Robots files are
+    /// tiny and per-host, so a database round trip would cost more than it saves.
+    robots: Arc<Mutex<HashMap<String, (Instant, String)>>>,
+    /// How research reaches public pages. Always the safety-checked public
+    /// fetcher in the app; tests substitute one that counts requests.
+    fetcher: Arc<dyn research::Fetcher>,
+}
+
+const ROBOTS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+impl research::PageCache for AppState {
+    fn robots(&self, host: &str) -> Option<String> {
+        let cache = self.robots.lock().ok()?;
+        cache
+            .get(host)
+            .filter(|(stored, _)| stored.elapsed() < ROBOTS_CACHE_TTL)
+            .map(|(_, text)| text.clone())
+    }
+
+    fn store_robots(&self, host: &str, text: &str) {
+        if let Ok(mut cache) = self.robots.lock() {
+            cache.insert(host.to_string(), (Instant::now(), text.to_string()));
+        }
+    }
+
+    fn page(&self, account_id: &str, url: &url::Url) -> Option<safety::FetchResult> {
+        db::cached_page(&*self.connection().ok()?, account_id, url.as_str())
+            .ok()
+            .flatten()
+    }
+
+    fn store_page(&self, account_id: &str, url: &url::Url, page: &safety::FetchResult) {
+        if let Ok(connection) = self.connection() {
+            let _ = db::store_page(&connection, account_id, url.as_str(), page);
+        }
+    }
+}
+
+/// Where search-run progress goes. The desktop app emits it to the window;
+/// headless evaluation records it. Searching never needs the window itself.
+type ProgressSink = Arc<dyn Fn(&SearchRunProgress) + Send + Sync>;
+
+fn window_progress_sink(app: &AppHandle) -> ProgressSink {
+    let app = app.clone();
+    Arc::new(move |progress| {
+        let _ = app.emit("search-run-progress", progress);
+    })
 }
 
 impl AppState {
@@ -100,7 +153,7 @@ async fn propose_sales_play(
     } else {
         context.chars().take(5_000).collect()
     };
-    ai::propose_sales_play(&state.client, &source_text, current).await
+    local_model::propose_sales_play(&state.client, &source_text, current).await
 }
 
 #[tauri::command]
@@ -116,7 +169,7 @@ async fn interpret_prospecting_query(
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().chars().take(500).collect::<String>());
     let play = db::load_sales_play(&*state.connection()?)?;
-    let mut brief = ai::interpret_search_brief(
+    let mut brief = local_model::interpret_search_brief(
         &clean_query,
         product_reference.as_deref(),
         &geography,
@@ -139,11 +192,48 @@ async fn interpret_prospecting_query(
     Ok(brief)
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignalSuggestions {
+    rules: Vec<QualificationRule>,
+    message: String,
+}
+
+#[tauri::command]
+async fn suggest_signal_rules(
+    state: State<'_, AppState>,
+    query: String,
+    segment_labels: Vec<String>,
+    existing: Vec<QualificationRule>,
+) -> AppResult<SignalSuggestions> {
+    let query = query.trim().chars().take(5_000).collect::<String>();
+    let segment_labels = segment_labels
+        .into_iter()
+        .take(8)
+        .map(|label| label.chars().take(80).collect())
+        .collect::<Vec<String>>();
+    // The current rules are shown to the model as examples, so they get the
+    // same bounds as any rule the plan editor sends.
+    let mut existing = existing;
+    existing.truncate(10);
+    signals::sanitize_rules(&mut existing);
+    match local_model::propose_signal_rules(&state.client, &query, &segment_labels, &existing).await
+    {
+        Ok((rules, message)) => Ok(SignalSuggestions { rules, message }),
+        // A suggestion failure never blocks a search; the plan already has rules.
+        Err(error) => Ok(SignalSuggestions {
+            rules: Vec::new(),
+            message: format!("The local model could not suggest signals: {error}"),
+        }),
+    }
+}
+
 #[tauri::command]
 async fn start_search_run(
     app: AppHandle,
     state: State<'_, AppState>,
     mut brief: SearchBrief,
+    reuse_candidates_from: Option<String>,
 ) -> AppResult<SearchRun> {
     if !brief
         .discovery_lanes
@@ -154,20 +244,39 @@ async fn start_search_run(
             "This brief has no compliant automatic discovery lane. Use its guided searches or import account seeds.".into(),
         ));
     }
+    // Rules arrive from the plan editor and the local model; neither is
+    // trusted to have bounded them.
+    signals::sanitize_rules(&mut brief.positive_signals);
     brief.approved = true;
-    let run = db::create_search_run(&*state.connection()?, &brief)?;
+    let run = {
+        let connection = state.connection()?;
+        let run = db::create_search_run(&connection, &brief)?;
+        if let Some(source) = reuse_candidates_from.as_deref() {
+            if let Err(error) = db::set_search_run_reuse(&connection, &run.id, source) {
+                db::finish_search_run(&connection, &run.id, "failed", Some(&error.to_string()))?;
+                return Err(error);
+            }
+        }
+        run
+    };
     let background = state.inner().clone();
     let run_id = run.id.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = execute_search_run(&background, &app, &run_id).await {
+        let sink = window_progress_sink(&app);
+        if let Err(error) = execute_search_run(&background, &sink, &run_id).await {
             if let Ok(connection) = background.connection() {
                 let _ =
                     db::finish_search_run(&connection, &run_id, "failed", Some(&error.to_string()));
             }
-            let _ = publish_search_finished(&background, &app, &run_id);
+            let _ = publish_search_finished(&background, &sink, &run_id);
         }
     });
     Ok(run)
+}
+
+#[tauri::command]
+fn get_search_brief(state: State<'_, AppState>, brief_id: String) -> AppResult<SearchBrief> {
+    db::get_search_brief(&*state.connection()?, &brief_id)
 }
 
 #[tauri::command]
@@ -320,7 +429,7 @@ async fn draft_readiness_for(state: &AppState, account_id: &str) -> AppResult<Dr
     if package.evidence.is_empty() {
         blockers.push("Research must produce cited evidence before drafting.".into());
     }
-    let ollama = ai::ollama_health(&state.client).await;
+    let ollama = local_model::ollama_health(&state.client).await;
     if !ollama.reachable || !ollama.model_installed {
         blockers.push(ollama.message.clone());
     }
@@ -446,7 +555,7 @@ fn list_jobs(state: State<'_, AppState>) -> AppResult<Vec<ResearchJob>> {
 
 #[tauri::command]
 async fn ollama_health(state: State<'_, AppState>) -> Result<OllamaHealth, AppError> {
-    Ok(ai::ollama_health(&state.client).await)
+    Ok(local_model::ollama_health(&state.client).await)
 }
 
 #[tauri::command]
@@ -475,7 +584,7 @@ fn export_data(state: State<'_, AppState>) -> AppResult<String> {
 
 #[tauri::command]
 async fn export_diagnostics(state: State<'_, AppState>) -> AppResult<String> {
-    let health = ai::ollama_health(&state.client).await;
+    let health = local_model::ollama_health(&state.client).await;
     let payload = {
         let connection = state.connection()?;
         let account_count: i64 =
@@ -608,7 +717,7 @@ async fn execute_generation_job(state: &AppState, app: &AppHandle, job_id: &str)
         ));
     }
     publish_job_progress(state, app, job_id, 20, "Composing locally")?;
-    let (assessment, mut draft, brief) = ai::generate_with_progress(
+    let (assessment, mut draft, brief) = local_model::generate_with_progress(
         &state.client,
         &package,
         &play,
@@ -640,12 +749,33 @@ async fn execute_generation_job(state: &AppState, app: &AppHandle, job_id: &str)
     Ok(())
 }
 
+/// Full research outside a search. It looks for evidence of the rules from the
+/// most recent search that found this account, or the phone-intake defaults
+/// when no search did.
 async fn execute_research(state: &AppState, account_id: &str, job_id: &str) -> AppResult<()> {
-    execute_research_with_depth(state, account_id, job_id, false).await
+    let brief = db::latest_brief_for_account(&*state.connection()?, account_id)?;
+    let (focus, personas) = match brief {
+        Some(brief) => (brief.positive_signals, brief.target_personas),
+        None => (signals::default_focus(), Vec::new()),
+    };
+    execute_research_with_depth(state, account_id, job_id, false, &focus, &personas).await
 }
 
-async fn execute_quick_research(state: &AppState, account_id: &str, job_id: &str) -> AppResult<()> {
-    execute_research_with_depth(state, account_id, job_id, true).await
+async fn execute_quick_research(
+    state: &AppState,
+    account_id: &str,
+    job_id: &str,
+    brief: &SearchBrief,
+) -> AppResult<()> {
+    execute_research_with_depth(
+        state,
+        account_id,
+        job_id,
+        true,
+        &brief.positive_signals,
+        &brief.target_personas,
+    )
+    .await
 }
 
 async fn execute_research_with_depth(
@@ -653,6 +783,8 @@ async fn execute_research_with_depth(
     account_id: &str,
     job_id: &str,
     quick: bool,
+    focus: &[QualificationRule],
+    personas: &[String],
 ) -> AppResult<()> {
     let account = {
         let connection = state.connection()?;
@@ -662,20 +794,23 @@ async fn execute_research_with_depth(
         )?;
         db::get_account(&connection, account_id)?
     };
-    let mut facts = if quick {
-        tokio::time::timeout(
-            Duration::from_secs(6),
-            research::crawl_account_quick(&state.client, &account),
-        )
-        .await
-        .map_err(|_| {
-            AppError::Message(
-                "Quick public research exceeded its 6-second per-company budget.".into(),
-            )
-        })??
+    // A deadline rather than a timeout around the whole crawl: a slow site
+    // still yields the pages it served in time, instead of nothing at all.
+    let (page_budget, allowance) = if quick {
+        (3, Duration::from_secs(6))
     } else {
-        research::crawl_account(&state.client, &account).await?
+        (8, Duration::from_secs(60))
     };
+    let mut facts = research::Crawl {
+        fetcher: state.fetcher.as_ref(),
+        cache: state,
+        focus,
+        personas,
+        page_budget,
+        deadline: Instant::now() + allowance,
+    }
+    .run(&account)
+    .await?;
     if !quick {
         facts.extend(adapters::refresh_public_signals(&state.client, &account).await);
     }
@@ -808,7 +943,7 @@ async fn process_search_candidate(
             },
         )?;
         let job_id = create_job(state, Some(account_id), "quick_crawl")?;
-        execute_quick_research(state, account_id, &job_id)
+        execute_quick_research(state, account_id, &job_id, brief)
             .await
             .err()
             .map(|error| {
@@ -867,7 +1002,7 @@ async fn process_search_candidate(
 /// per tick at high candidate targets. The UI pages accounts in separately.
 fn publish_search_progress(
     state: &AppState,
-    app: &AppHandle,
+    sink: &ProgressSink,
     run_id: &str,
     percent: i64,
     stage: &str,
@@ -877,14 +1012,14 @@ fn publish_search_progress(
         db::set_search_run_stage(&connection, run_id, percent, stage)?;
         db::get_search_run_progress(&connection, run_id)?
     };
-    let _ = app.emit("search-run-progress", progress);
+    sink(&progress);
     Ok(())
 }
 
 /// Emit the terminal tick for a run that has reached a final state.
-fn publish_search_finished(state: &AppState, app: &AppHandle, run_id: &str) -> AppResult<()> {
+fn publish_search_finished(state: &AppState, sink: &ProgressSink, run_id: &str) -> AppResult<()> {
     let progress = db::get_search_run_progress(&*state.connection()?, run_id)?;
-    let _ = app.emit("search-run-progress", progress);
+    sink(&progress);
     Ok(())
 }
 
@@ -918,6 +1053,7 @@ async fn resolve_and_discover_reference_data(
     run_id: &str,
     query: &str,
     terms: &str,
+    geography: &str,
     limit: usize,
     rotation: usize,
 ) -> AppResult<Vec<DiscoveryResult>> {
@@ -925,7 +1061,7 @@ async fn resolve_and_discover_reference_data(
     // proposes the kinds of organization that serve it, and those go first
     // because they are far likelier to be real Wikidata classes than raw
     // keywords from the sentence. Keyword pairs remain the offline fallback.
-    let mut phrases = ai::propose_audience_types(&state.client, query)
+    let mut phrases = local_model::propose_audience_types(&state.client, query)
         .await
         .unwrap_or_default();
     let proposed = phrases.clone();
@@ -985,16 +1121,37 @@ async fn resolve_and_discover_reference_data(
     // Rotation pages deeper into the same class so a repeat search surfaces
     // organizations the previous run did not reach.
     let offset = rotation.saturating_mul(limit.max(1)) % 1_000;
-    wikidata::discover_instances(&state.client, &classes, limit, offset).await
+    let (found, warning) = wikidata::discover_instances(
+        &state.client,
+        &classes,
+        limit,
+        offset,
+        regions::wikidata_state(geography),
+    )
+    .await?;
+    if let Some(message) = warning {
+        db::add_search_warning(
+            &*state.connection()?,
+            run_id,
+            SourceWarning {
+                source: "Open reference data".into(),
+                message,
+                used_cached_results: false,
+                cache_age_hours: None,
+            },
+        )?;
+    }
+    Ok(found)
 }
 
-async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> AppResult<()> {
-    let brief = {
-        let connection = state.connection()?;
-        let run = db::get_search_run(&connection, run_id)?;
-        db::get_search_brief(&connection, &run.brief_id)?
-    };
-    publish_search_progress(state, app, run_id, 2, "Preparing enabled sources")?;
+/// Discovery and import for a fresh run. `None` when the run was cancelled.
+async fn discover_candidates(
+    state: &AppState,
+    sink: &ProgressSink,
+    run_id: &str,
+    brief: &SearchBrief,
+) -> AppResult<Option<Vec<String>>> {
+    publish_search_progress(state, sink, run_id, 2, "Preparing enabled sources")?;
     let candidate_budget = (brief.result_limit * 5).max(30).clamp(1, 100) as usize;
     // Shifts which bounded regions this run samples first. Without it, repeat
     // searches re-sample one bounding box and return the same companies.
@@ -1010,7 +1167,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         let lane_start = 5 + (lane_index as i64 * 20 / lane_total);
         publish_search_progress(
             state,
-            app,
+            sink,
             run_id,
             lane_start,
             &format!("Searching {}", lane.label),
@@ -1135,8 +1292,11 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
                 }
             }
             "wikidata" => {
-                let terms = ai::reference_terms(&brief.query);
-                let cache_key = format!("wikidata:{terms}:r{rotation}");
+                let terms = local_model::reference_terms(&brief.query);
+                let scope = regions::wikidata_state(&brief.geography)
+                    .map(|state| state.id)
+                    .unwrap_or("us");
+                let cache_key = format!("wikidata:{terms}:{scope}:r{rotation}");
                 let cached = db::cached_discoveries(&*state.connection()?, &cache_key)?;
                 let backoff = db::source_backoff(&*state.connection()?, "wikidata")?;
                 if let Some((cached_results, _age)) = cached.as_ref().filter(|(_, age)| *age < 24) {
@@ -1164,6 +1324,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
                         run_id,
                         &brief.query,
                         &terms,
+                        &brief.geography,
                         candidate_budget,
                         rotation,
                     )
@@ -1229,7 +1390,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         }
         publish_search_progress(
             state,
-            app,
+            sink,
             run_id,
             5 + ((lane_index as i64 + 1) * 20 / lane_total),
             &format!("Finished {}", lane.label),
@@ -1239,8 +1400,8 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         }
     }
     results.sort_by(|left, right| {
-        discovery_priority(right, &brief)
-            .cmp(&discovery_priority(left, &brief))
+        discovery_priority(right, brief)
+            .cmp(&discovery_priority(left, brief))
             .then_with(|| left.company_name.cmp(&right.company_name))
     });
     let mut seen = std::collections::HashSet::new();
@@ -1257,7 +1418,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
     results.truncate(candidate_budget);
     publish_search_progress(
         state,
-        app,
+        sink,
         run_id,
         30,
         &format!("Found {} candidate records", results.len()),
@@ -1274,7 +1435,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
     let mut seen_accounts = std::collections::HashSet::new();
     for result in results {
         if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
-            return Ok(());
+            return Ok(None);
         }
         let account_id = db::import_discovery_result(&mut *state.connection()?, run_id, &result)?;
         db::update_search_run_account(
@@ -1296,11 +1457,48 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
             candidate_ids.push(account_id);
         }
     }
+    Ok(Some(candidate_ids))
+}
+
+async fn execute_search_run(state: &AppState, sink: &ProgressSink, run_id: &str) -> AppResult<()> {
+    let brief = {
+        let connection = state.connection()?;
+        let run = db::get_search_run(&connection, run_id)?;
+        db::get_search_brief(&connection, &run.brief_id)?
+    };
+    // A re-score reuses the candidates of an earlier run instead of
+    // discovering new ones, so edited rules can be judged against the same
+    // companies, and their recently read pages come from the page cache.
+    let reuse_from = db::search_run_reuse_source(&*state.connection()?, run_id)?;
+    let candidate_ids = match reuse_from {
+        Some(source) => {
+            let ids = db::copy_search_candidates(&*state.connection()?, &source, run_id)?;
+            if ids.is_empty() {
+                return Err(AppError::Message(
+                    "The earlier search has no candidates to re-score.".into(),
+                ));
+            }
+            let total = ids.len() as i64;
+            db::set_search_run_counts(&*state.connection()?, run_id, total, 0)?;
+            publish_search_progress(
+                state,
+                sink,
+                run_id,
+                30,
+                &format!("Re-scoring {total} candidates from the earlier search"),
+            )?;
+            ids
+        }
+        None => match discover_candidates(state, sink, run_id, &brief).await? {
+            Some(ids) => ids,
+            None => return Ok(()),
+        },
+    };
     let total = candidate_ids.len() as i64;
     db::set_search_run_progress(&*state.connection()?, run_id, 0, total)?;
     publish_search_progress(
         state,
-        app,
+        sink,
         run_id,
         40,
         if total == 0 {
@@ -1310,119 +1508,117 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         },
     )?;
 
-    // Research a broad pre-ranked pool in bounded batches. The requested count
-    // is the maximum number of strong matches, never a pre-research truncation.
-    // These are all distinct hosts; per-site politeness comes from the delay
-    // inside crawl_account_with_page_budget, not from this width.
+    // Research a broad pre-ranked pool with a constant number of candidates in
+    // flight. The requested count is the maximum number of strong matches,
+    // never a pre-research truncation. Fixed batches used to wait for their
+    // slowest site before starting the next, idling most workers at each
+    // boundary. These are all distinct hosts; per-site politeness comes from
+    // the delay inside the crawl, not from this width.
     const PARALLEL_RESEARCH: usize = 12;
     let budget = search_budget(brief.result_limit);
     let started = std::time::Instant::now();
     let mut completed = 0_i64;
     let mut stopped_by_budget = false;
-    let batch_size = brief.result_limit.max(1) as usize;
-    let mut confirmation_due = false;
-    for batch in candidate_ids.chunks(batch_size) {
-        if started.elapsed() >= budget {
-            stopped_by_budget = true;
+    let finalize_every = brief.result_limit.max(1);
+    let mut since_finalize = 0_i64;
+    // Once the requested number of strong matches exists, research one more
+    // request-sized slice to confirm the band, then stop starting new work.
+    let mut confirmation_quota: Option<i64> = None;
+    let mut pending = candidate_ids.iter().cloned();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        while tasks.len() < PARALLEL_RESEARCH && confirmation_quota != Some(0) {
+            let Some(account_id) = pending.next() else {
+                break;
+            };
+            if let Some(quota) = confirmation_quota.as_mut() {
+                *quota -= 1;
+            }
+            let background = state.clone();
+            let task_run_id = run_id.to_string();
+            let task_brief = brief.clone();
+            tasks.spawn(async move {
+                let outcome =
+                    process_search_candidate(&background, &task_run_id, &account_id, &task_brief)
+                        .await;
+                (account_id, outcome)
+            });
+        }
+        if tasks.is_empty() {
             break;
         }
-        let mut pending = batch.iter().cloned();
-        let mut tasks = tokio::task::JoinSet::new();
-        loop {
-            while tasks.len() < PARALLEL_RESEARCH {
-                let Some(account_id) = pending.next() else {
-                    break;
-                };
-                let background = state.clone();
-                let task_run_id = run_id.to_string();
-                let task_brief = brief.clone();
-                tasks.spawn(async move {
-                    let outcome = process_search_candidate(
-                        &background,
-                        &task_run_id,
-                        &account_id,
-                        &task_brief,
-                    )
-                    .await;
-                    (account_id, outcome)
-                });
-            }
-            if tasks.is_empty() {
-                break;
-            }
-            if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
-                tasks.abort_all();
-                return Ok(());
-            }
-            let (account_id, outcome) = tasks
-                .join_next()
-                .await
-                .ok_or_else(|| {
-                    AppError::Message("Search research queue stopped unexpectedly.".into())
-                })?
-                .map_err(|error| {
-                    AppError::Message(format!(
-                        "Search research worker stopped unexpectedly: {error}"
-                    ))
-                })?;
-            if let Err(error) = outcome {
-                let reasons = vec![format!(
-                    "Candidate processing failed: {}",
-                    error.to_string().chars().take(240).collect::<String>()
-                )];
-                db::update_search_run_account(
-                    &*state.connection()?,
-                    run_id,
-                    &account_id,
-                    db::SearchRunAccountUpdate {
-                        state: "failed",
-                        score: None,
-                        confidence: "low",
-                        rejection_reasons: &reasons,
-                        features: &[],
-                        assessment: None,
-                        rank: None,
-                        result_tier: "excluded",
-                    },
-                )?;
-            }
-            completed += 1;
-            db::set_search_run_progress(&*state.connection()?, run_id, completed, total)?;
-            db::set_search_run_counts(&*state.connection()?, run_id, total, completed)?;
-            publish_search_progress(
-                state,
-                app,
+        if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
+            tasks.abort_all();
+            return Ok(());
+        }
+        let Some(left) = budget.checked_sub(started.elapsed()) else {
+            stopped_by_budget = true;
+            tasks.abort_all();
+            break;
+        };
+        let Ok(joined) = tokio::time::timeout(left, tasks.join_next()).await else {
+            stopped_by_budget = true;
+            tasks.abort_all();
+            break;
+        };
+        let (account_id, outcome) = joined
+            .ok_or_else(|| AppError::Message("Search research queue stopped unexpectedly.".into()))?
+            .map_err(|error| {
+                AppError::Message(format!(
+                    "Search research worker stopped unexpectedly: {error}"
+                ))
+            })?;
+        if let Err(error) = outcome {
+            let reasons = vec![format!(
+                "Candidate processing failed: {}",
+                error.to_string().chars().take(240).collect::<String>()
+            )];
+            db::update_search_run_account(
+                &*state.connection()?,
                 run_id,
-                40 + (completed * 55 / total.max(1)),
-                &format!("Researched {completed} of {total} discovered candidates"),
+                &account_id,
+                db::SearchRunAccountUpdate {
+                    state: "failed",
+                    score: None,
+                    confidence: "low",
+                    rejection_reasons: &reasons,
+                    features: &[],
+                    assessment: None,
+                    rank: None,
+                    result_tier: "excluded",
+                },
             )?;
-            if started.elapsed() >= budget {
-                stopped_by_budget = true;
-                tasks.abort_all();
-                break;
-            }
         }
-        let (strong, _) = db::finalize_search_ranking(
-            &*state.connection()?,
+        completed += 1;
+        db::set_search_run_progress(&*state.connection()?, run_id, completed, total)?;
+        db::set_search_run_counts(&*state.connection()?, run_id, total, completed)?;
+        publish_search_progress(
+            state,
+            sink,
             run_id,
-            brief.qualification_threshold,
-            brief.quality_band,
-            brief.result_limit,
+            40 + (completed * 55 / total.max(1)),
+            &format!("Researched {completed} of {total} discovered candidates"),
         )?;
-        if confirmation_due {
-            break;
-        }
-        confirmation_due = strong >= brief.result_limit;
-        if started.elapsed() >= budget {
-            stopped_by_budget = true;
-            break;
+        since_finalize += 1;
+        if since_finalize >= finalize_every {
+            since_finalize = 0;
+            let (strong, _) = db::finalize_search_ranking(
+                &*state.connection()?,
+                run_id,
+                brief.qualification_threshold,
+                brief.quality_band,
+                brief.result_limit,
+            )?;
+            if confirmation_quota.is_none() && strong >= brief.result_limit {
+                confirmation_quota = Some(brief.result_limit);
+            }
         }
     }
     if db::search_run_is_cancelled(&*state.connection()?, run_id)? {
         return Ok(());
     }
     db::set_search_run_progress(&*state.connection()?, run_id, completed, total)?;
-    publish_search_progress(state, app, run_id, 98, "Finalizing ranked results")?;
+    publish_search_progress(state, sink, run_id, 98, "Finalizing ranked results")?;
     db::finalize_search_ranking(
         &*state.connection()?,
         run_id,
@@ -1450,7 +1646,7 @@ async fn execute_search_run(state: &AppState, app: &AppHandle, run_id: &str) -> 
         )?;
     }
     db::finish_search_run(&*state.connection()?, run_id, "complete", None)?;
-    publish_search_finished(state, app, run_id)?;
+    publish_search_finished(state, sink, run_id)?;
     Ok(())
 }
 
@@ -1538,6 +1734,15 @@ fn search_budget(result_limit: i64) -> Duration {
     Duration::from_secs((45 + result_limit.max(0) * 3).clamp(45, 240) as u64)
 }
 
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .user_agent("ProspectingWorkbenchBot/0.1 (+local desktop research; respects robots.txt)")
+        .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
+        .build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1557,18 +1762,15 @@ pub fn run() {
                     Some("Interrupted because a newer search was active."),
                 )?;
             }
-            let client = Client::builder()
-                .user_agent(
-                    "ProspectingWorkbenchBot/0.1 (+local desktop research; respects robots.txt)",
-                )
-                .redirect(Policy::none())
-                .connect_timeout(Duration::from_secs(8))
-                .timeout(Duration::from_secs(20))
-                .build()?;
+            let client = build_client()?;
             let state = AppState {
                 database: Arc::new(Mutex::new(connection)),
+                fetcher: Arc::new(research::PublicFetcher {
+                    client: client.clone(),
+                }),
                 client,
                 app_data_dir,
+                robots: Arc::default(),
             };
             let background = state.clone();
             let search_background = state.clone();
@@ -1581,8 +1783,8 @@ pub fn run() {
             });
             tauri::async_runtime::spawn(async move {
                 if let Some(run_id) = resumable_search {
-                    if let Err(error) =
-                        execute_search_run(&search_background, &search_app, &run_id).await
+                    let sink = window_progress_sink(&search_app);
+                    if let Err(error) = execute_search_run(&search_background, &sink, &run_id).await
                     {
                         if let Ok(connection) = search_background.connection() {
                             let _ = db::finish_search_run(
@@ -1606,7 +1808,9 @@ pub fn run() {
             save_sales_play,
             propose_sales_play,
             interpret_prospecting_query,
+            suggest_signal_rules,
             start_search_run,
+            get_search_brief,
             list_search_runs,
             get_search_run,
             cancel_search_run,
@@ -1700,6 +1904,7 @@ mod command_policy_tests {
                 keywords: vec!["emergency service".into()],
                 points: 55,
                 hard_gate: false,
+                origin: "pack".into(),
             }],
             exclusions: vec![],
             discovery_lanes: vec![],
@@ -1754,5 +1959,266 @@ mod command_policy_tests {
         // "in", "the" and similar must never earn relevance points.
         let noise = discovery("Generic Co", "in the of and", false);
         assert_eq!(relevance_score(&noise, &brief), 0);
+    }
+}
+
+/// Live yield evaluation against the real public sources.
+///
+/// Ignored by default: it needs network access and takes minutes. Run it with
+/// `scripts/live-search-eval.sh`, before and after a change, and compare.
+#[cfg(test)]
+mod live_eval {
+    use super::*;
+
+    const BRIEFS: &[(&str, &str)] = &[
+        (
+            "I sell payroll and shift scheduling software to restaurants with hourly staff",
+            "Austin, TX",
+        ),
+        (
+            "We sell HIPAA compliance and patient data security software to dental practices",
+            "Pennsylvania",
+        ),
+        (
+            "I am a screenwriter with a pilot script looking for literary representation",
+            "United States",
+        ),
+    ];
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_search_yield_eval() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            database: Arc::new(Mutex::new(
+                db::open(&directory.path().join("eval.sqlite3")).unwrap(),
+            )),
+            client: build_client().unwrap(),
+            app_data_dir: directory.path().to_path_buf(),
+            robots: Arc::default(),
+            fetcher: Arc::new(research::PublicFetcher {
+                client: build_client().unwrap(),
+            }),
+        };
+        let sink: ProgressSink = Arc::new(|_| {});
+        for (query, geography) in BRIEFS {
+            let mut brief = local_model::interpret_search_brief(query, None, geography, 10, None)
+                .await
+                .unwrap();
+            brief.approved = true;
+            let run = db::create_search_run(&state.connection().unwrap(), &brief).unwrap();
+            let started = std::time::Instant::now();
+            let outcome = execute_search_run(&state, &sink, &run.id).await;
+            let elapsed = started.elapsed().as_secs();
+            let run = db::get_search_run(&state.connection().unwrap(), &run.id).unwrap();
+            println!("\n=== {query} ({geography})");
+            if let Err(error) = outcome {
+                println!("run error: {error}");
+            }
+            for warning in &run.warnings {
+                println!("warning [{}]: {}", warning.source, warning.message);
+            }
+            let researched = run
+                .accounts
+                .iter()
+                .filter(|item| !matches!(item.state.as_str(), "screening" | "researching"))
+                .collect::<Vec<_>>();
+            let with_evidence = researched
+                .iter()
+                .filter(|item| {
+                    db::get_package(&state.connection().unwrap(), &item.account.id)
+                        .map(|package| {
+                            package
+                                .evidence
+                                .iter()
+                                .any(|evidence| !evidence.source_kind.ends_with("_record"))
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            println!(
+                "wall {elapsed}s · found {} · researched {} · with page evidence {with_evidence} · strong {} · near {}",
+                run.candidate_count,
+                researched.len(),
+                run.strong_count,
+                run.near_match_count
+            );
+            for rule in &brief.positive_signals {
+                let hits = researched
+                    .iter()
+                    .filter(|item| {
+                        item.matched_features
+                            .iter()
+                            .any(|feature| feature.rule_id == rule.id)
+                    })
+                    .count();
+                println!(
+                    "rule {:<28} hit {hits}/{}",
+                    rule.id,
+                    researched.len().max(1)
+                );
+            }
+            let mut ranked = run
+                .accounts
+                .iter()
+                .filter(|item| item.result_tier != "excluded")
+                .collect::<Vec<_>>();
+            ranked.sort_by_key(|item| item.rank.unwrap_or(i64::MAX));
+            for item in ranked.iter().take(5) {
+                println!(
+                    "  #{} {} [{}] score {} · {}",
+                    item.rank.unwrap_or_default(),
+                    item.account.name,
+                    item.result_tier,
+                    item.score.unwrap_or_default(),
+                    item.account.website_url.as_deref().unwrap_or("no website")
+                );
+                let package =
+                    db::get_package(&state.connection().unwrap(), &item.account.id).unwrap();
+                for feature in item
+                    .matched_features
+                    .iter()
+                    .filter(|feature| feature.component == "signal")
+                {
+                    let quote = package
+                        .evidence
+                        .iter()
+                        .find(|evidence| feature.evidence_ids.contains(&evidence.id))
+                        .map(|evidence| evidence.excerpt.chars().take(140).collect::<String>())
+                        .unwrap_or_default();
+                    println!("      {}: \"{quote}\"", feature.label);
+                }
+            }
+        }
+    }
+}
+
+/// Re-scoring an earlier run's candidates with edited rules.
+#[cfg(test)]
+mod rescore_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Serves each site's homepage, answers 404 for everything else, and
+    /// counts every request.
+    struct Sites {
+        homepages: HashMap<String, String>,
+        requests: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl research::Fetcher for Sites {
+        async fn fetch(&self, url: url::Url) -> AppResult<safety::FetchResult> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            match self.homepages.get(url.as_str()) {
+                Some(text) => Ok(safety::FetchResult {
+                    final_url: url.clone(),
+                    title: "Home".into(),
+                    text: text.clone(),
+                    links: vec![],
+                    etag: None,
+                    modified_at: None,
+                    technologies: vec![],
+                }),
+                None => Err(AppError::Message(
+                    "Source returned HTTP 404 Not Found.".into(),
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rescore_reuses_candidates_and_cached_pages_without_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let pages = [
+            ("Barton Taqueria", "Barton Taqueria serves tacos at three Austin locations.\nWe're hiring servers and line cooks now.\nFlexible shifts and weekly pay for every team member.\nEmail hello@bartontaqueria.example"),
+            ("Quiet Cafe", "A quiet cafe run by two owners on Cesar Chavez.\nWe are not hiring at this time.\nEmail hello@quietcafe.example"),
+        ];
+        let domain = |name: &str| format!("{}.example", name.to_ascii_lowercase().replace(' ', ""));
+        let sites = Arc::new(Sites {
+            homepages: pages
+                .iter()
+                .map(|(name, text)| (format!("https://{}/", domain(name)), text.to_string()))
+                .collect(),
+            requests: AtomicUsize::new(0),
+        });
+        let state = AppState {
+            database: Arc::new(Mutex::new(
+                db::open(&directory.path().join("rescore.sqlite3")).unwrap(),
+            )),
+            client: build_client().unwrap(),
+            app_data_dir: directory.path().to_path_buf(),
+            robots: Arc::default(),
+            fetcher: sites.clone(),
+        };
+        let mut brief = local_model::interpret_search_brief(
+            "I sell payroll and shift scheduling software to restaurants with hourly staff",
+            None,
+            "Austin, TX",
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+        brief.approved = true;
+
+        // A first run discovers and researches both candidates.
+        let first = db::create_search_run(&state.connection().unwrap(), &brief).unwrap();
+        for (index, (name, _)) in pages.iter().enumerate() {
+            let result = DiscoveryResult {
+                source: "OpenStreetMap".into(),
+                company_name: (*name).into(),
+                domain: Some(domain(name)),
+                website_url: Some(format!("https://{}/", domain(name))),
+                external_id: None,
+                reason: "Mapped restaurant in the bounded Austin metro sample.".into(),
+                source_url: format!("https://www.openstreetmap.org/node/{index}"),
+                source_external_id: None,
+                business_phone: None,
+                location: Some("Austin metro, Texas, United States".into()),
+                identity_confidence: Some("medium".into()),
+            };
+            let account_id =
+                db::import_discovery_result(&mut state.connection().unwrap(), &first.id, &result)
+                    .unwrap();
+            process_search_candidate(&state, &first.id, &account_id, &brief)
+                .await
+                .unwrap();
+        }
+        db::finish_search_run(&state.connection().unwrap(), &first.id, "complete", None).unwrap();
+        let first_requests = sites.requests.load(Ordering::SeqCst);
+        assert!(first_requests > 0);
+
+        // The user marks a rule required and re-scores the same candidates.
+        let mut edited = brief.clone();
+        edited.id = "edited-brief".into();
+        edited.positive_signals[0].hard_gate = true;
+        let rescore = db::create_search_run(&state.connection().unwrap(), &edited).unwrap();
+        db::set_search_run_reuse(&state.connection().unwrap(), &rescore.id, &first.id).unwrap();
+        let sink: ProgressSink = Arc::new(|_| {});
+        execute_search_run(&state, &sink, &rescore.id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sites.requests.load(Ordering::SeqCst),
+            first_requests,
+            "the re-score made no network request"
+        );
+        let run = db::get_search_run(&state.connection().unwrap(), &rescore.id).unwrap();
+        assert_eq!(run.accounts.len(), 2);
+        let state_of = |name: &str| {
+            run.accounts
+                .iter()
+                .find(|item| item.account.name == name)
+                .map(|item| item.state.clone())
+                .unwrap()
+        };
+        assert_eq!(state_of("Barton Taqueria"), "qualified");
+        assert_ne!(state_of("Quiet Cafe"), "qualified");
+        assert!(run
+            .rule_health
+            .iter()
+            .any(|rate| rate.rule_id == edited.positive_signals[0].id && rate.assessed == 2));
     }
 }

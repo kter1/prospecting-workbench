@@ -18,7 +18,7 @@ Prospecting Workbench accepts changes that preserve its free, local-first, evide
 
 ## Architecture
 
-TypeScript contracts live in `src/types.ts`; their Rust equivalents live in `src-tauri/src/models.rs`. Schema changes must update both and include a migration. SQLite is accessed through one serialized writer. Crawling belongs in `safety.rs` and `research.rs`; source-specific discovery belongs in `adapters.rs`; scoring and artifact verification belong in `ai.rs`/application code.
+TypeScript contracts live in `src/types.ts`; their Rust equivalents live in `src-tauri/src/models.rs`. Schema changes must update both and include a migration. SQLite is accessed through one serialized writer. Crawling belongs in `safety.rs` and `research.rs`; source-specific discovery belongs in `adapters.rs`; scoring belongs in `qualification.rs`, and artifact verification in `local_model.rs`.
 
 New adapters must fail independently, document rate limits, cap responses, and include recorded fixtures covering malformed, stale, duplicated, rate-limited, and injection-bearing data.
 

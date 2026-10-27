@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::models::*;
+use crate::safety::FetchResult;
 
 type SearchRunDbRow = (
     String,
@@ -58,6 +59,8 @@ pub fn open(path: &Path) -> AppResult<Connection> {
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.execute_batch(include_str!("../migrations/001_init.sql"))?;
     connection.execute_batch(include_str!("../migrations/002_prompt_first.sql"))?;
+    connection.execute_batch(include_str!("../migrations/003_page_cache.sql"))?;
+    purge_page_cache(&connection)?;
     let has_quality_flags = {
         let mut statement = connection.prepare("PRAGMA table_info(evidence)")?;
         let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -80,6 +83,10 @@ pub fn open(path: &Path) -> AppResult<Connection> {
     migrate_search_progress_schema(&connection)?;
     migrate_quality_first_schema(&connection)?;
     migrate_prompt_first_data(&connection)?;
+    if !table_has_column(&connection, "search_runs", "reuse_from")? {
+        // A re-score run reuses the candidate list of this earlier run.
+        connection.execute("ALTER TABLE search_runs ADD COLUMN reuse_from TEXT", [])?;
+    }
     Ok(connection)
 }
 
@@ -825,6 +832,20 @@ pub fn add_signal(
     evidence_id: &str,
     confidence: &str,
 ) -> AppResult<()> {
+    // A careers page yields its opening text and, separately, the hiring line
+    // inside it. Keep one: skip a summary that repeats, or is repeated by, a
+    // signal already stored for this account and category.
+    let summary_key = crate::matcher::normalized(summary);
+    let mut statement =
+        connection.prepare("SELECT summary FROM signals WHERE account_id=?1 AND category=?2")?;
+    let repeats = statement
+        .query_map(params![account_id, category], |row| row.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .map(|existing| crate::matcher::normalized(&existing))
+        .any(|existing| existing.contains(&summary_key) || summary_key.contains(&existing));
+    if repeats {
+        return Ok(());
+    }
     connection.execute(
         "INSERT OR IGNORE INTO signals(id,account_id,category,summary,evidence_id,confidence)
          VALUES(?1,?2,?3,?4,?5,?6)",
@@ -1487,6 +1508,24 @@ pub fn running_search_run_ids(connection: &Connection) -> AppResult<Vec<String>>
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// The brief of the most recent search that discovered this account.
+pub fn latest_brief_for_account(
+    connection: &Connection,
+    account_id: &str,
+) -> AppResult<Option<SearchBrief>> {
+    let brief_id: Option<String> = connection
+        .query_row(
+            "SELECT r.brief_id FROM search_run_accounts a JOIN search_runs r ON r.id=a.search_run_id
+             WHERE a.account_id=?1 AND r.brief_id IS NOT NULL ORDER BY r.started_at DESC LIMIT 1",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    brief_id
+        .map(|id| get_search_brief(connection, &id))
+        .transpose()
+}
+
 pub fn get_search_run(connection: &Connection, run_id: &str) -> AppResult<SearchRun> {
     let base: Option<SearchRunDbRow> = connection
         .query_row(
@@ -1566,6 +1605,11 @@ pub fn get_search_run(connection: &Connection, run_id: &str) -> AppResult<Search
             })
         })
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    let rule_health = brief_id
+        .as_deref()
+        .and_then(|id| get_search_brief(connection, id).ok())
+        .map(|brief| rule_hit_rates(&brief.positive_signals, &accounts))
+        .unwrap_or_default();
     Ok(SearchRun {
         id,
         query,
@@ -1584,8 +1628,112 @@ pub fn get_search_run(connection: &Connection, run_id: &str) -> AppResult<Search
         started_at,
         completed_at,
         last_error,
+        rule_health,
         accounts,
     })
+}
+
+pub fn set_search_run_reuse(connection: &Connection, run_id: &str, source: &str) -> AppResult<()> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM search_runs WHERE id=?1)",
+        params![source],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(AppError::Message(
+            "The search to re-score no longer exists.".into(),
+        ));
+    }
+    connection.execute(
+        "UPDATE search_runs SET reuse_from=?2 WHERE id=?1",
+        params![run_id, source],
+    )?;
+    Ok(())
+}
+
+pub fn search_run_reuse_source(connection: &Connection, run_id: &str) -> AppResult<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT reuse_from FROM search_runs WHERE id=?1",
+            params![run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Copy an earlier run's candidates into a new run, best first, for
+/// re-scoring under edited rules. Returns their account ids in that order.
+pub fn copy_search_candidates(
+    connection: &Connection,
+    from_run: &str,
+    to_run: &str,
+) -> AppResult<Vec<String>> {
+    let timestamp = now();
+    connection.execute(
+        "INSERT OR IGNORE INTO search_run_accounts(search_run_id,account_id,state,discovery_source,discovery_reason,created_at,updated_at,result_tier)
+         SELECT ?2,account_id,'screening',discovery_source,discovery_reason,?3,?3,'excluded'
+         FROM search_run_accounts WHERE search_run_id=?1",
+        params![from_run, to_run, timestamp],
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT account_id FROM search_run_accounts WHERE search_run_id=?1
+         ORDER BY COALESCE(rank,9999),COALESCE(score,-1) DESC,created_at",
+    )?;
+    let ids = statement
+        .query_map(params![from_run], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// How often each rule fired across a run's assessed candidates.
+///
+/// A rule that fires on nearly everyone cannot tell candidates apart, and one
+/// that never fires is probably worded differently from how sites write. Both
+/// are worth telling the user before they trust the ranking.
+pub fn rule_hit_rates(
+    rules: &[QualificationRule],
+    accounts: &[SearchRunAccount],
+) -> Vec<RuleHitRate> {
+    let assessed = accounts
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.state.as_str(),
+                "qualified" | "needs_review" | "rejected"
+            )
+        })
+        .collect::<Vec<_>>();
+    rules
+        .iter()
+        .map(|rule| {
+            let hits = assessed
+                .iter()
+                .filter(|item| {
+                    item.matched_features
+                        .iter()
+                        .any(|feature| feature.rule_id == rule.id)
+                })
+                .count() as i64;
+            let total = assessed.len() as i64;
+            let verdict = if total < 5 {
+                "too_few"
+            } else if hits == 0 {
+                "never_found"
+            } else if hits * 10 > total * 8 {
+                "not_discriminating"
+            } else {
+                "ok"
+            };
+            RuleHitRate {
+                rule_id: rule.id.clone(),
+                label: rule.label.clone(),
+                hits,
+                assessed: total,
+                verdict: verdict.into(),
+            }
+        })
+        .collect()
 }
 
 /// Counters and status for a run, without touching `search_run_accounts`.
@@ -1981,6 +2129,105 @@ pub fn cached_discoveries(
         Ok((serde_json::from_str(&json)?, age))
     })
     .transpose()
+}
+
+/// How long a cached page is reused instead of re-fetched.
+const PAGE_REUSE_HOURS: i64 = 24;
+/// How long a cached page is kept at all.
+const PAGE_RETENTION_DAYS: i64 = 7;
+
+pub fn cached_page(
+    connection: &Connection,
+    account_id: &str,
+    url: &str,
+) -> AppResult<Option<FetchResult>> {
+    let row = connection
+        .query_row(
+            "SELECT final_url,title,text,links_json,etag,modified_at,fetched_at,technologies_json FROM page_cache WHERE account_id=?1 AND url=?2",
+            params![account_id, url],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((final_url, title, text, links_json, etag, modified_at, fetched_at, technologies)) =
+        row
+    else {
+        return Ok(None);
+    };
+    let fresh = chrono::DateTime::parse_from_rfc3339(&fetched_at).is_ok_and(|fetched| {
+        Utc::now()
+            .signed_duration_since(fetched.with_timezone(&Utc))
+            .num_hours()
+            < PAGE_REUSE_HOURS
+    });
+    let Ok(final_url) = url::Url::parse(&final_url) else {
+        return Ok(None);
+    };
+    if !fresh {
+        return Ok(None);
+    }
+    let links = serde_json::from_str::<Vec<String>>(&links_json)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|link| url::Url::parse(link).ok())
+        .collect();
+    Ok(Some(FetchResult {
+        final_url,
+        title,
+        text,
+        links,
+        etag,
+        modified_at,
+        technologies: serde_json::from_str(&technologies).unwrap_or_default(),
+    }))
+}
+
+pub fn store_page(
+    connection: &Connection,
+    account_id: &str,
+    url: &str,
+    page: &FetchResult,
+) -> AppResult<()> {
+    let links = page.links.iter().map(url::Url::as_str).collect::<Vec<_>>();
+    connection.execute(
+        "INSERT INTO page_cache(account_id,url,final_url,title,text,links_json,etag,modified_at,fetched_at,technologies_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(account_id,url) DO UPDATE SET final_url=excluded.final_url,title=excluded.title,text=excluded.text,
+           links_json=excluded.links_json,etag=excluded.etag,modified_at=excluded.modified_at,fetched_at=excluded.fetched_at,
+           technologies_json=excluded.technologies_json",
+        params![
+            account_id,
+            url,
+            page.final_url.as_str(),
+            page.title,
+            page.text,
+            serde_json::to_string(&links)?,
+            page.etag,
+            page.modified_at,
+            now(),
+            serde_json::to_string(&page.technologies)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn purge_page_cache(connection: &Connection) -> AppResult<()> {
+    let cutoff = (Utc::now() - chrono::Duration::days(PAGE_RETENTION_DAYS)).to_rfc3339();
+    connection.execute(
+        "DELETE FROM page_cache WHERE fetched_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(())
 }
 
 pub fn set_source_backoff(
@@ -2393,6 +2640,7 @@ pub fn clear_prospects(connection: &Connection) -> AppResult<()> {
          DELETE FROM signals;
          DELETE FROM evidence;
          DELETE FROM people;
+         DELETE FROM page_cache;
          DELETE FROM accounts;",
     )?;
     Ok(())
@@ -2402,7 +2650,7 @@ pub fn delete_all(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
         "DELETE FROM search_run_accounts; DELETE FROM search_runs; DELETE FROM search_briefs; DELETE FROM source_identities; DELETE FROM discovery_cache; DELETE FROM source_backoff; DELETE FROM offer_profile;
          DELETE FROM outcomes; DELETE FROM suppressions; DELETE FROM jobs; DELETE FROM draft_artifacts; DELETE FROM packages;
-         DELETE FROM contacts; DELETE FROM signals; DELETE FROM evidence; DELETE FROM people; DELETE FROM accounts;
+         DELETE FROM contacts; DELETE FROM signals; DELETE FROM evidence; DELETE FROM people; DELETE FROM page_cache; DELETE FROM accounts;
          DELETE FROM sales_play; DELETE FROM settings;",
     )?;
     Ok(())
@@ -3098,5 +3346,180 @@ mod tests {
         restore_json(&mut connection, &export.to_string()).unwrap();
         assert!(list_accounts(&connection).unwrap().is_empty());
         assert_eq!(CONTRACT_VERSION, 3);
+    }
+
+    #[test]
+    fn cached_pages_are_reused_for_a_day_and_purged_with_their_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = open(&directory.path().join("cache.sqlite3")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO accounts(id,name,status,created_at,updated_at) VALUES('a','Acme','new',?1,?1)",
+                params![now()],
+            )
+            .unwrap();
+        let page = FetchResult {
+            final_url: Url::parse("https://acme.example/").unwrap(),
+            title: "Acme".into(),
+            text: "Acme provides plumbing.".into(),
+            links: vec![Url::parse("https://acme.example/about").unwrap()],
+            etag: None,
+            modified_at: None,
+            technologies: vec![],
+        };
+        store_page(&connection, "a", "https://acme.example/", &page).unwrap();
+        let cached = cached_page(&connection, "a", "https://acme.example/")
+            .unwrap()
+            .expect("fresh page is reused");
+        assert_eq!(cached.text, page.text);
+        assert_eq!(cached.links, page.links);
+
+        let stale = (Utc::now() - Duration::hours(30)).to_rfc3339();
+        connection
+            .execute("UPDATE page_cache SET fetched_at=?1", params![stale])
+            .unwrap();
+        assert!(cached_page(&connection, "a", "https://acme.example/")
+            .unwrap()
+            .is_none());
+
+        connection.execute("DELETE FROM accounts", []).unwrap();
+        let remaining: i64 = connection
+            .query_row("SELECT count(*) FROM page_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn rule_health_flags_rules_that_do_not_separate_candidates() {
+        let rule = |id: &str| QualificationRule {
+            id: id.into(),
+            label: id.into(),
+            component: "signal".into(),
+            keywords: vec!["x".into()],
+            points: 45,
+            hard_gate: false,
+            origin: "pack".into(),
+        };
+        let candidate = |matched: &[&str]| SearchRunAccount {
+            account: Account {
+                id: "a".into(),
+                name: "A".into(),
+                domain: None,
+                website_url: None,
+                industry: None,
+                employee_band: None,
+                location: None,
+                status: "new".into(),
+                score: None,
+                score_label: None,
+                researched_at: None,
+                created_at: "now".into(),
+                saved_at: None,
+                favorited_at: None,
+                trashed_at: None,
+            },
+            state: "needs_review".into(),
+            discovery_source: "s".into(),
+            discovery_reason: "r".into(),
+            score: None,
+            evidence_confidence: "medium".into(),
+            rejection_reasons: vec![],
+            matched_features: matched
+                .iter()
+                .map(|id| FitFeature {
+                    rule_id: (*id).into(),
+                    label: (*id).into(),
+                    component: "signal".into(),
+                    value: "present".into(),
+                    points_awarded: 45,
+                    evidence_ids: vec!["e".into()],
+                    confidence: "high".into(),
+                })
+                .collect(),
+            assessment: None,
+            rank: None,
+            result_tier: "near_match".into(),
+        };
+        // "everywhere" fires on all ten candidates, "some" on one.
+        let accounts = (0..10)
+            .map(|index| {
+                candidate(if index == 0 {
+                    &["everywhere", "some"][..]
+                } else {
+                    &["everywhere"][..]
+                })
+            })
+            .collect::<Vec<_>>();
+        let rates = rule_hit_rates(
+            &[rule("everywhere"), rule("some"), rule("nowhere")],
+            &accounts,
+        );
+        let verdict = |id: &str| {
+            rates
+                .iter()
+                .find(|rate| rate.rule_id == id)
+                .unwrap()
+                .verdict
+                .clone()
+        };
+        assert_eq!(verdict("everywhere"), "not_discriminating");
+        assert_eq!(verdict("some"), "ok");
+        assert_eq!(verdict("nowhere"), "never_found");
+        assert_eq!(
+            rule_hit_rates(&[rule("some")], &accounts[..3])[0].verdict,
+            "too_few"
+        );
+    }
+
+    #[test]
+    fn a_signal_repeated_inside_another_is_stored_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = open(&directory.path().join("signals.sqlite3")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO accounts(id,name,status,created_at,updated_at) VALUES('a','Acme','new',?1,?1)",
+                params![now()],
+            )
+            .unwrap();
+        for (id, excerpt) in [("e1", "page"), ("e2", "line")] {
+            connection
+                .execute(
+                    "INSERT INTO evidence(id,account_id,source_url,source_kind,title,excerpt,retrieved_at,content_hash,confidence,freshness)
+                     VALUES(?1,'a','https://acme.example/careers','careers_page','Careers',?2,?3,?1,'high','fresh')",
+                    params![id, excerpt, now()],
+                )
+                .unwrap();
+        }
+        let page = "We're hiring servers and line cooks. Flexible shifts and weekly pay.";
+        add_signal(&connection, "a", "hiring", page, "e1", "medium").unwrap();
+        add_signal(
+            &connection,
+            "a",
+            "hiring",
+            "We're hiring servers and line cooks.",
+            "e2",
+            "high",
+        )
+        .unwrap();
+        add_signal(
+            &connection,
+            "a",
+            "funding",
+            "We're hiring servers and line cooks.",
+            "e2",
+            "high",
+        )
+        .unwrap();
+        let count = |category: &str| -> i64 {
+            connection
+                .query_row(
+                    "SELECT count(*) FROM signals WHERE category=?1",
+                    params![category],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("hiring"), 1);
+        assert_eq!(count("funding"), 1, "other categories are independent");
     }
 }

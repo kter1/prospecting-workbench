@@ -4,7 +4,8 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { listen } from "@tauri-apps/api/event";
 import { api, isDesktopRuntime } from "./api";
 import { parseSeedInput } from "./lib/csv";
-import { canRunAutomatically, coverageLabel, guidedSearchQueries, safePublicWebsite, searchProgress, shortfallExplanation } from "./lib/search";
+import { SignalEditor } from "./SignalEditor";
+import { canRunAutomatically, coverageLabel, guidedSearchQueries, mergeSuggestedRules, safePublicWebsite, searchProgress, shortfallExplanation } from "./lib/search";
 import type {
   Account,
   DashboardSnapshot,
@@ -433,10 +434,10 @@ function App() {
             activeRun={activeRun}
             busy={busy}
             onInterpret={(query, geography, resultLimit, productWebsite) => api.interpretProspectingQuery(query, geography, resultLimit, productWebsite)}
-            onStart={(brief) => withBusy("search-run", async () => {
-              const run = await api.startSearchRun(brief);
+            onStart={(brief, reuseFrom) => withBusy("search-run", async () => {
+              const run = await api.startSearchRun(brief, reuseFrom);
               setActiveRun(run);
-              setNotice("Discovery started. Evidence-backed candidates will appear progressively.");
+              setNotice(reuseFrom ? "Re-scoring the earlier candidates with your edited signals." : "Discovery started. Evidence-backed candidates will appear progressively.");
             })}
             onCancel={() => activeRun && withBusy("cancel-run", async () => setActiveRun(await api.cancelSearchRun(activeRun.id)))}
             onClearRun={() => { setActiveRun(undefined); setNotice(undefined); setError(undefined); }}
@@ -529,7 +530,7 @@ function SalesPlayEditor({ initial, busy, proposing, onPropose, onSave }: { init
 
   return (
     <form className="page-grid play-grid" onSubmit={(event) => { event.preventDefault(); onSave({ ...play, approved: true }); }}>
-      <section className="panel span-2 proposal-panel"><div><span className="step">Local AI setup</span><h2>Start from a website or description</h2><p>Ollama can propose the play structure. Website text is sanitized and treated as untrusted evidence. The proposal remains unapproved until you review it.</p></div><div><textarea value={proposalContext} onChange={(event) => setProposalContext(event.target.value)} placeholder="https://your-company.example, or describe the offer, customers, and proof you can substantiate."/><button type="button" className="button secondary wide" disabled={proposing} onClick={() => onPropose(proposalContext, play)}>{proposing ? "Proposing locally…" : "Propose with Ollama"}</button></div></section>
+      <section className="panel span-2 proposal-panel"><div><span className="step">Local setup</span><h2>Start from a website or description</h2><p>Ollama can propose the play structure. Website text is sanitized and treated as untrusted evidence. The proposal remains unapproved until you review it.</p></div><div><textarea value={proposalContext} onChange={(event) => setProposalContext(event.target.value)} placeholder="https://your-company.example, or describe the offer, customers, and proof you can substantiate."/><button type="button" className="button secondary wide" disabled={proposing} onClick={() => onPropose(proposalContext, play)}>{proposing ? "Proposing locally…" : "Propose with Ollama"}</button></div></section>
       <section className="panel span-2">
         <div className="section-heading"><div><span className="step">01</span><h2>Offer and audience</h2></div><p>These stable offer details inform future query interpretation. Every search brief is still reviewed separately.</p></div>
         <div className="form-grid">
@@ -560,13 +561,32 @@ function SalesPlayEditor({ initial, busy, proposing, onPropose, onSave }: { init
   );
 }
 
+/** Up to three signal rules a candidate matched, each with its source count. */
+function ruleChips(item: SearchRun["accounts"][number]) {
+  const signals = item.matchedFeatures.filter((feature) => feature.component === "signal" && feature.evidenceIds.length > 0);
+  if (!signals.length) return null;
+  return <div className="rule-chips">{signals.slice(0, 3).map((feature) => <span className="chip" key={feature.ruleId} title={`${feature.evidenceIds.length} quoted source${feature.evidenceIds.length === 1 ? "" : "s"}; open the candidate to read them`}>{feature.label}</span>)}{signals.length > 3 && <span className="chip muted-chip">+{signals.length - 3}</span>}</div>;
+}
+
+const RULE_VERDICT: Record<string, string> = {
+  not_discriminating: "fired on almost every candidate, so it is not telling them apart",
+  never_found: "was found nowhere; its keywords may not match how these sites write"
+};
+
+/** Rules that are not doing their job in this run, so the user can fix them. */
+function RuleHealth({ rates }: { rates: NonNullable<SearchRun["ruleHealth"]> }) {
+  const flagged = rates.filter((rate) => RULE_VERDICT[rate.verdict]);
+  if (!flagged.length) return null;
+  return <div className="rule-health" role="note"><strong>Signals to review</strong><ul>{flagged.map((rate) => <li key={rate.ruleId}><b>{rate.label}</b> ({rate.hits} of {rate.assessed}) {RULE_VERDICT[rate.verdict]}.</li>)}</ul><span>Use “Edit signals and re-score” to adjust them without searching again.</span></div>;
+}
+
 function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfirm, onInterpret, onStart, onCancel, onClearRun, onClearHistory, onOpenRun, onOpenAccount, onLibraryAction, onImport, onDiscover, onAddResults }: {
   capabilities: DashboardSnapshot["sourceCapabilities"];
   recentRuns: SearchRunSummary[];
   activeRun?: SearchRun;
   busy?: string;
   onInterpret: (query: string, geography: string, resultLimit: number, productWebsite?: string) => Promise<SearchBrief>;
-  onStart: (brief: SearchBrief) => Promise<void>;
+  onStart: (brief: SearchBrief, reuseCandidatesFrom?: string) => Promise<void>;
   onCancel: () => void;
   onClearRun: () => void;
   onClearHistory: () => void;
@@ -592,6 +612,8 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
   const [searching, setSearching] = useState(false);
   const [clock, setClock] = useState(Date.now());
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set());
+  const [suggestionStatus, setSuggestionStatus] = useState<string>();
+  const [rescoreFrom, setRescoreFrom] = useState<{ runId: string; candidates: number }>();
   const planRef = useRef<HTMLElement>(null);
 
   // The plan compiles instantly and offline, and renders below the prompt. On a
@@ -601,6 +623,24 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
     if (!brief) return;
     planRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     planRef.current?.focus({ preventScroll: true });
+  }, [brief?.id]);
+
+  // Ask the local model for product-specific signals once per plan. The plan is
+  // usable immediately; suggestions merge in when they arrive and never
+  // overwrite a rule the user has already edited.
+  useEffect(() => {
+    if (!brief || brief.interpreter === "browser_preview") return;
+    const planId = brief.id;
+    let current = true;
+    setSuggestionStatus("Asking the local model for signals specific to your product…");
+    api.suggestSignalRules(brief.query, brief.segments.map((segment) => segment.label), brief.positiveSignals)
+      .then((result) => {
+        if (!current) return;
+        setBrief((latest) => latest && latest.id === planId ? { ...latest, positiveSignals: mergeSuggestedRules(latest.positiveSignals, result.rules) } : latest);
+        setSuggestionStatus(result.message);
+      })
+      .catch((reason) => { if (current) setSuggestionStatus(`Local model suggestions are unavailable: ${String(reason)}`); });
+    return () => { current = false; };
   }, [brief?.id]);
 
   useEffect(() => setSelectedAccounts(new Set()), [activeRun?.id]);
@@ -645,6 +685,19 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
     }
   };
 
+  // Re-open the finished run's plan for editing, keeping its candidates.
+  const editAndRescore = async (finished: SearchRun) => {
+    try {
+      const previous = await api.getSearchBrief(finished.briefId);
+      setRescoreFrom({ runId: finished.id, candidates: finished.accounts.length });
+      setBrief({ ...previous, id: crypto.randomUUID(), approved: false });
+      setSelectedAccounts(new Set());
+      onClearRun();
+    } catch (reason) {
+      setLocalError(String(reason));
+    }
+  };
+
   const run = activeRun;
   const progress = searchProgress(run);
   const elapsedSeconds = run
@@ -670,14 +723,14 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
   const selectableAccounts = run?.status === "running" ? run.accounts : [...strongMatches, ...nearMatches];
   const candidateSection = (title: string, items: SearchRun["accounts"], tone: "success" | "warning" | "neutral" = "neutral") => items.length ? <section className="candidate-section"><div className="candidate-section-heading"><h3>{title}</h3><Badge tone={tone}>{items.length}</Badge></div><div className="candidate-grid">{items.map((item) => <article key={item.account.id} className="candidate-card">
     <div className="candidate-card-top"><button type="button" className={selectedAccounts.has(item.account.id) ? "avatar selector selected" : "avatar selector"} aria-pressed={selectedAccounts.has(item.account.id)} aria-label={`Select ${item.account.name}`} onClick={() => setSelectedAccounts((current) => { const next = new Set(current); next.has(item.account.id) ? next.delete(item.account.id) : next.add(item.account.id); return next; })}>{selectedAccounts.has(item.account.id) ? "✓" : item.account.name.slice(0, 2).toUpperCase()}</button><div className="badge-row"><Badge tone={item.resultTier === "strong" ? "success" : item.resultTier === "excluded" ? "danger" : "warning"}>{item.resultTier.replaceAll("_", " ")}</Badge><Badge>{item.discoverySource}</Badge></div></div>
-    <button type="button" className="candidate-body" onClick={() => onOpenAccount(item.account.id, run!.id)}><h3 title={item.account.name}>{item.account.name}</h3><p className="clamp-3" title={item.discoveryReason}>{item.discoveryReason}</p>{item.rejectionReasons[0] && <p className="candidate-caveat clamp-2" title={item.rejectionReasons[0]}>{item.rejectionReasons[0]}</p>}</button>
+    <button type="button" className="candidate-body" onClick={() => onOpenAccount(item.account.id, run!.id)}><h3 title={item.account.name}>{item.account.name}</h3><p className="clamp-3" title={item.discoveryReason}>{item.discoveryReason}</p>{ruleChips(item)}{item.rejectionReasons[0] && <p className="candidate-caveat clamp-2" title={item.rejectionReasons[0]}>{item.rejectionReasons[0]}</p>}</button>
     {safePublicWebsite(item.account.websiteUrl) && <button type="button" className="website-link" onClick={() => openExternal(safePublicWebsite(item.account.websiteUrl)!, setLocalError)}>Website ↗</button>}
     <div className="candidate-footer"><span><b>{item.score ?? "—"}</b> fit</span><span>Evidence: {item.evidenceConfidence}</span></div>
   </article>)}</div></section> : null;
 
   return <div className="discover-workflow">
     <section className="prompt-hero panel">
-      <span className="eyebrow">Local AI targeting compiler</span>
+      <span className="eyebrow">Targeting compiler</span>
       <h2>What do you sell, and what business problem does it solve?</h2>
       <p>The search plan is compiled instantly. The workbench exposes its assumptions before it accesses any discovery source.</p>
       <form onSubmit={interpret} className="prompt-form">
@@ -697,17 +750,19 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
       <p className="receipt-summary">Looking for <strong>{brief.segments.map((item) => item.label).join(", ") || "organizations matching your description"}</strong> in <strong>{brief.geography}</strong>, and keeping up to <strong>{brief.resultLimit}</strong> that public evidence actually supports.</p>
       <div className="receipt-actions primary-first">
         {automatic
-          ? <button className="button primary" disabled={busy === "search-run"} onClick={() => void onStart({ ...brief, approved: true })}>{busy === "search-run" ? "Starting…" : `Start search for up to ${brief.resultLimit} matches`}</button>
+          ? <button className="button primary" disabled={busy === "search-run"} onClick={() => void onStart({ ...brief, approved: true }, rescoreFrom?.runId)}>{busy === "search-run" ? "Starting…" : rescoreFrom ? `Re-score ${rescoreFrom.candidates} candidates` : `Start search for up to ${brief.resultLimit} matches`}</button>
           : <strong className="blocked-reason">This plan cannot run automatically. See below.</strong>}
-        <button className="button ghost" onClick={() => setBrief(undefined)}>Edit the description</button>
+        <button className="button ghost" onClick={() => { setBrief(undefined); setRescoreFrom(undefined); }}>Edit the description</button>
       </div>
-      <p className="muted">Sources: {coverageLabel(brief)}. Searching visits public websites; reviewing this plan does not.</p>
+      {rescoreFrom
+        ? <p className="alert">Re-scoring the {rescoreFrom.candidates} candidates from your earlier search with these signals. Pages read in the last 24 hours are reused, so nothing is discovered or re-downloaded.</p>
+        : <p className="muted">Sources: {coverageLabel(brief)}. Searching visits public websites; reviewing this plan does not.</p>}
       <div className="receipt-grid">
         <div><span className="eyebrow">Outcome</span><p>{brief.customerOutcome}</p></div>
-        <div><span className="eyebrow">Signals</span><div className="chip-row">{brief.positiveSignals.map((item) => <span className="chip" key={item.id}>{item.label}</span>)}</div></div>
         <div><span className="eyebrow">Personas</span><div className="chip-row">{brief.targetPersonas.map((item) => <span className="chip" key={item}>{item}</span>)}</div></div>
         <div><span className="eyebrow">Exclusions</span><div className="chip-row">{brief.exclusions.length ? brief.exclusions.map((item) => <span className="chip muted-chip" key={item}>{item}</span>) : <span className="muted">None proposed</span>}</div></div>
       </div>
+      <SignalEditor rules={brief.positiveSignals} status={suggestionStatus} onChange={(positiveSignals) => setBrief({ ...brief, positiveSignals })} />
       <div className="lane-list">{brief.discoveryLanes.map((lane) => <div key={lane.id}><Badge tone={lane.mode === "automatic" ? "success" : "neutral"}>{lane.mode}</Badge><span><strong>{lane.label}</strong><small>{lane.reason} {lane.limitation}</small></span></div>)}</div>
       {brief.assumptions.length > 0 && <div className="assumption-box"><strong>Assumptions to review</strong><ul>{brief.assumptions.map((item) => <li key={item}>{item}</li>)}</ul></div>}
       <details className="advanced-brief"><summary>Edit boundaries</summary><div className="form-grid"><label>Geography<input value={brief.geography} onChange={(event) => setBrief({ ...brief, geography: event.target.value })} /></label><label>Qualification threshold<input type="number" min={1} max={100} value={brief.qualificationThreshold} onChange={(event) => setBrief({ ...brief, qualificationThreshold: Number(event.target.value) })} /></label><label>Maximum primary score span<input type="number" min={0} max={20} value={brief.qualityBand} onChange={(event) => setBrief({ ...brief, qualityBand: Number(event.target.value) })} /></label><label className="span-2">Exclusions<textarea value={brief.exclusions.join("\n")} onChange={(event) => setBrief({ ...brief, exclusions: splitList(event.target.value) })} /></label></div></details>
@@ -724,9 +779,9 @@ function DiscoverView({ capabilities, recentRuns, activeRun, busy, requestConfir
       {run.status === "running" && <button className="button ghost" disabled={busy === "cancel-run"} onClick={onCancel}>Cancel search</button>}
       {selectableAccounts.length > 0 && <button className="select-all result-select-all" onClick={() => setSelectedAccounts(selectedAccounts.size === selectableAccounts.length ? new Set() : new Set(selectableAccounts.map((item) => item.account.id)))}>{selectedAccounts.size === selectableAccounts.length ? "Clear visible selection" : "Select all visible matches"}</button>}
       {selectedAccounts.size > 0 && <div className="bulk-toolbar"><strong>{selectedAccounts.size} selected</strong><button onClick={() => onLibraryAction([...selectedAccounts], "save")}>Save</button><button onClick={() => onLibraryAction([...selectedAccounts], "favorite")}>Favorite</button><button className="danger-text" onClick={() => onLibraryAction([...selectedAccounts], "trash")}>Move to Trash</button><button onClick={() => setSelectedAccounts(new Set())}>Clear</button></div>}
-      {run.status === "running" ? candidateSection("Candidates being evaluated", run.accounts) : <><div className="result-summary"><strong>{run.strongCount} strong match{run.strongCount === 1 ? "" : "es"}</strong><span>Discovered {run.candidateCount} · Researched {run.researchedCount} · Requested up to {run.resultLimit}</span>{run.strongCount < run.resultLimit && <small>{shortfallExplanation(run)}</small>}</div>{candidateSection("Strong Matches", strongMatches, "success")}{candidateSection("Near Matches", nearMatches, "warning")}{excluded.length > 0 && <details className="excluded-results"><summary>Excluded or failed diagnostics ({excluded.length})</summary>{candidateSection("Excluded or Failed", excluded)}</details>}</>}
+      {run.status === "running" ? candidateSection("Candidates being evaluated", run.accounts) : <><div className="result-summary"><strong>{run.strongCount} strong match{run.strongCount === 1 ? "" : "es"}</strong><span>Discovered {run.candidateCount} · Researched {run.researchedCount} · Requested up to {run.resultLimit}</span>{run.strongCount < run.resultLimit && <small>{shortfallExplanation(run)}</small>}</div><RuleHealth rates={run.ruleHealth ?? []} />{candidateSection("Strong Matches", strongMatches, "success")}{candidateSection("Near Matches", nearMatches, "warning")}{excluded.length > 0 && <details className="excluded-results"><summary>Excluded or failed diagnostics ({excluded.length})</summary>{candidateSection("Excluded or Failed", excluded)}</details>}</>}
       {!run.accounts.length && run.status !== "running" && <p className="muted">No automatic candidates were returned. Use the guided or seeded routes; the workbench will not fill the list with unsupported matches.</p>}
-      {run.status !== "running" && <button className="button primary" onClick={() => { setBrief(undefined); setSelectedAccounts(new Set()); onClearRun(); }}>Start another search</button>}
+      {run.status !== "running" && <div className="receipt-actions"><button className="button primary" onClick={() => { setBrief(undefined); setRescoreFrom(undefined); setSelectedAccounts(new Set()); onClearRun(); }}>Start another search</button>{run.briefId && run.accounts.length > 0 && <button className="button secondary" onClick={() => void editAndRescore(run)}>Edit signals and re-score</button>}</div>}
     </section>}
 
     {!run && recentRuns.length > 0 && <section className="panel"><div className="section-heading"><div><h3>Recent searches</h3></div><button className="button ghost danger-text" onClick={() => requestConfirm({ title: "Clear search history?", body: `This removes all ${recentRuns.length} past searches and their cached results. Saved prospects are kept.`, confirmLabel: "Clear history", onConfirm: onClearHistory })}>Clear history</button></div><div className="recent-runs">{recentRuns.slice(0, 5).map((item) => <button key={item.id} onClick={() => void onOpenRun(item.id)}><span><strong>{item.query}</strong><small>{item.strongCount} strong · {item.qualifiedCount} qualified · {item.reviewCount} review</small></span><Badge>{item.status}</Badge></button>)}</div></section>}
@@ -795,7 +850,7 @@ function SettingsView({ capabilities, onExport, onDiagnostics, onImport, onClear
   const [sourceNotice, setSourceNotice] = useState("");
   useEffect(() => { void api.ollamaHealth().then(setHealth).catch(() => setHealth({ reachable: false, modelInstalled: false, modelTag: "qwen3.5:9b", message: "Ollama is not reachable." })); }, []);
   useEffect(() => { void api.getSearxngUrl().then(setSearxngUrl); }, []);
-  return <div className="page-grid"><section className="panel"><h2>Local model</h2><div className="health-card"><span className={health?.modelInstalled ? "health-icon ok" : "health-icon"}>◎</span><div><strong>{health?.modelTag ?? "Checking…"}</strong><p>{health?.message}</p></div></div><p className="muted">Requires 16 GB RAM and about 12 GB of free disk. The workbench never falls back to hosted AI.</p></section><section className="panel"><h2>Data controls</h2><p>All prospecting data lives in the local application directory. Raw HTML is discarded after evidence extraction.</p><div className="stack"><button className="button secondary" onClick={onExport}>Export local data</button><button className="button secondary" onClick={onDiagnostics}>Export privacy-safe diagnostics</button><label className="button ghost file-button">Restore local export<input type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (file.size > 25 * 1024 * 1024) { setSourceNotice("Import exceeds the 25 MB limit."); return; } requestConfirm({ title: "Replace all local data?", body: `Importing ${file.name} replaces every prospect, evidence row and search in this app. This cannot be undone.`, confirmLabel: "Replace everything", onConfirm: () => void file.text().then(onImport) }); event.target.value = ""; }} /></label><button className="button ghost danger-text" onClick={() => requestConfirm({ title: "Clear all prospects?", body: "Every prospect, its evidence, contacts and drafts will be removed, along with all search history. Your offer profile, sender identity and settings are kept.", confirmLabel: "Clear prospects", onConfirm: onClearProspects })}>Clear all prospects</button><button className="button ghost danger-text" onClick={() => requestConfirm({ title: "Delete everything?", body: "All prospects, evidence, searches, drafts, your offer profile and every setting will be erased. Export first if you want a copy. This cannot be undone.", confirmLabel: "Delete all data", onConfirm: onDelete })}>Delete all data</button></div></section><section className="panel span-2"><h2>Optional local search</h2><p>SearXNG is never required. Add a base URL only if you operate your own instance; clearing it disables the adapter.</p><div className="inline-form"><input aria-label="SearXNG base URL" value={searxngUrl} onChange={(event) => setSearxngUrl(event.target.value)} placeholder="http://127.0.0.1:8080" /><button className="button secondary" onClick={() => void api.setSearxngUrl(searxngUrl).then((saved) => { setSearxngUrl(saved); setSourceNotice(saved ? "SearXNG configured." : "SearXNG disabled."); })}>Save source</button></div>{sourceNotice && <p className="muted">{sourceNotice}</p>}</section><section className="panel span-2"><h2>Source capabilities</h2><div className="source-grid">{capabilities.map((item) => <div key={item.id}><Badge tone={item.enabled ? "success" : "neutral"}>{item.enabled ? "Ready" : "Optional"}</Badge><strong>{item.name}</strong><p>{item.detail}</p></div>)}</div></section></div>;
+  return <div className="page-grid"><section className="panel"><h2>Local model</h2><div className="health-card"><span className={health?.modelInstalled ? "health-icon ok" : "health-icon"}>◎</span><div><strong>{health?.modelTag ?? "Checking…"}</strong><p>{health?.message}</p></div></div><p className="muted">Requires 16 GB RAM and about 12 GB of free disk. The workbench never falls back to hosted models.</p></section><section className="panel"><h2>Data controls</h2><p>All prospecting data lives in the local application directory. Raw HTML is discarded after evidence extraction.</p><div className="stack"><button className="button secondary" onClick={onExport}>Export local data</button><button className="button secondary" onClick={onDiagnostics}>Export privacy-safe diagnostics</button><label className="button ghost file-button">Restore local export<input type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (file.size > 25 * 1024 * 1024) { setSourceNotice("Import exceeds the 25 MB limit."); return; } requestConfirm({ title: "Replace all local data?", body: `Importing ${file.name} replaces every prospect, evidence row and search in this app. This cannot be undone.`, confirmLabel: "Replace everything", onConfirm: () => void file.text().then(onImport) }); event.target.value = ""; }} /></label><button className="button ghost danger-text" onClick={() => requestConfirm({ title: "Clear all prospects?", body: "Every prospect, its evidence, contacts and drafts will be removed, along with all search history. Your offer profile, sender identity and settings are kept.", confirmLabel: "Clear prospects", onConfirm: onClearProspects })}>Clear all prospects</button><button className="button ghost danger-text" onClick={() => requestConfirm({ title: "Delete everything?", body: "All prospects, evidence, searches, drafts, your offer profile and every setting will be erased. Export first if you want a copy. This cannot be undone.", confirmLabel: "Delete all data", onConfirm: onDelete })}>Delete all data</button></div></section><section className="panel span-2"><h2>Optional local search</h2><p>SearXNG is never required. Add a base URL only if you operate your own instance; clearing it disables the adapter.</p><div className="inline-form"><input aria-label="SearXNG base URL" value={searxngUrl} onChange={(event) => setSearxngUrl(event.target.value)} placeholder="http://127.0.0.1:8080" /><button className="button secondary" onClick={() => void api.setSearxngUrl(searxngUrl).then((saved) => { setSearxngUrl(saved); setSourceNotice(saved ? "SearXNG configured." : "SearXNG disabled."); })}>Save source</button></div>{sourceNotice && <p className="muted">{sourceNotice}</p>}</section><section className="panel span-2"><h2>Source capabilities</h2><div className="source-grid">{capabilities.map((item) => <div key={item.id}><Badge tone={item.enabled ? "success" : "neutral"}>{item.enabled ? "Ready" : "Optional"}</Badge><strong>{item.name}</strong><p>{item.detail}</p></div>)}</div></section></div>;
 }
 
 function EmptyState() {

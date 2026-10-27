@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const CONTRACT_VERSION: u8 = 3;
 pub const MODEL_TAG: &str = "qwen3.5:9b";
 pub const PROMPT_VERSION: &str = "prospect-package-v1";
-pub const SEARCH_PROMPT_VERSION: &str = "search-brief-v3";
+pub const SEARCH_PROMPT_VERSION: &str = "search-brief-v4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +81,9 @@ pub struct QualificationRule {
     pub keywords: Vec<String>,
     pub points: i64,
     pub hard_gate: bool,
+    /// Where the rule came from: `catalog`, `pack`, `model`, `query` or `user`.
+    #[serde(default)]
+    pub origin: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +169,17 @@ pub struct SearchRunAccount {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RuleHitRate {
+    pub rule_id: String,
+    pub label: String,
+    pub hits: i64,
+    pub assessed: i64,
+    /// `ok`, `too_few`, `never_found` or `not_discriminating`.
+    pub verdict: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceWarning {
     pub source: String,
     pub message: String,
@@ -201,6 +215,9 @@ pub struct SearchRun {
     pub completed_at: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// How often each plan rule fired across the assessed candidates.
+    #[serde(default)]
+    pub rule_health: Vec<RuleHitRate>,
     pub accounts: Vec<SearchRunAccount>,
 }
 
@@ -531,7 +548,7 @@ pub struct DashboardSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AiPackageOutput {
+pub struct DraftPackageOutput {
     pub reasons: Vec<CitedReason>,
     pub subject: String,
     pub body: String,

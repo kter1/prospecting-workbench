@@ -11,6 +11,7 @@ use crate::catalog;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::*;
+use crate::signals;
 
 const OLLAMA_URL: &str = "http://127.0.0.1:11434";
 
@@ -63,23 +64,23 @@ struct SearchBriefProposal {
     customer_outcome: String,
     segment_ids: Vec<String>,
     target_personas: Vec<String>,
-    signal_ids: Vec<String>,
+    rules: Vec<QualificationRule>,
     exclusions: Vec<String>,
     assumptions: Vec<String>,
 }
 
 #[async_trait]
-pub trait AiProvider {
+pub trait DraftProvider {
     async fn health(&self) -> OllamaHealth;
     async fn compose(
         &self,
         package: &ProspectPackage,
         play: &SalesPlay,
         draft_kind: &str,
-    ) -> AppResult<(AiPackageOutput, String)>;
+    ) -> AppResult<(DraftPackageOutput, String)>;
     async fn verify(
         &self,
-        output: &AiPackageOutput,
+        output: &DraftPackageOutput,
         evidence: &[Evidence],
         play: &SalesPlay,
     ) -> AppResult<(Vec<String>, Vec<ClaimEvidence>)>;
@@ -90,7 +91,7 @@ pub struct OllamaProvider<'a> {
 }
 
 #[async_trait]
-impl AiProvider for OllamaProvider<'_> {
+impl DraftProvider for OllamaProvider<'_> {
     async fn health(&self) -> OllamaHealth {
         ollama_health(self.client).await
     }
@@ -100,7 +101,7 @@ impl AiProvider for OllamaProvider<'_> {
         package: &ProspectPackage,
         play: &SalesPlay,
         draft_kind: &str,
-    ) -> AppResult<(AiPackageOutput, String)> {
+    ) -> AppResult<(DraftPackageOutput, String)> {
         let health = self.health().await;
         if !health.reachable || !health.model_installed {
             return Err(AppError::Message(health.message));
@@ -129,7 +130,7 @@ impl AiProvider for OllamaProvider<'_> {
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         let value = ollama_chat(self.client, messages, package_schema(&evidence_ids)).await?;
-        let output: AiPackageOutput = serde_json::from_value(value)?;
+        let output: DraftPackageOutput = serde_json::from_value(value)?;
         validate_shape(&output)?;
         Ok((
             output,
@@ -141,7 +142,7 @@ impl AiProvider for OllamaProvider<'_> {
 
     async fn verify(
         &self,
-        output: &AiPackageOutput,
+        output: &DraftPackageOutput,
         evidence: &[Evidence],
         play: &SalesPlay,
     ) -> AppResult<(Vec<String>, Vec<ClaimEvidence>)> {
@@ -314,11 +315,7 @@ pub async fn interpret_search_brief(
         .iter()
         .filter_map(|id| segment_template(id))
         .collect::<Vec<_>>();
-    let signals = proposal
-        .signal_ids
-        .iter()
-        .filter_map(|id| signal_template(id))
-        .collect::<Vec<_>>();
+    let signals = proposal.rules.clone();
     let mut lanes = Vec::new();
     if segments
         .iter()
@@ -427,14 +424,56 @@ pub async fn interpret_search_brief(
     })
 }
 
-fn manual_search_proposal(query: &str, play: Option<&SalesPlay>) -> SearchBriefProposal {
+/// The part of a description that names who the user wants to reach.
+///
+/// "I sell payroll software *to restaurants*": the product words ("payroll",
+/// "software", and in other requests "security" or "marketing") describe the
+/// seller, and matching them against the business catalog targeted the
+/// seller's competitors. The audience follows the last "to", "for", "serving"
+/// or "targeting".
+///
+/// Only for descriptions of something the user sells. In a request for help,
+/// "I need a literary agent for my novel", the clause after "for" is the
+/// user's own work, and the whole sentence describes who to find.
+pub fn audience_clause(query: &str) -> Option<&str> {
     let lower = query.to_ascii_lowercase();
-    let voice_related = ["voice", "phone", "call", "intake", "answering"]
+    let selling = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| {
+            matches!(
+                word,
+                "sell" | "sells" | "selling" | "offer" | "offers" | "provide" | "provides"
+            )
+        })
+        || [
+            "our product",
+            "our software",
+            "our platform",
+            "our service",
+            "we build",
+        ]
         .iter()
-        .any(|value| lower.contains(value));
-    // Whole-word matching against the curated catalog. The previous substring
-    // table had nine entries and misfired on words that merely contained them.
-    let matched = catalog::match_query(query);
+        .any(|phrase| lower.contains(phrase));
+    if !selling {
+        return None;
+    }
+    [" to ", " for ", " serving ", " targeting ", " aimed at "]
+        .iter()
+        .filter_map(|marker| lower.rfind(marker).map(|index| index + marker.len()))
+        .max()
+        .map(|start| query[start..].trim())
+        .filter(|clause| !clause.is_empty())
+}
+
+fn manual_search_proposal(query: &str, play: Option<&SalesPlay>) -> SearchBriefProposal {
+    let packs = signals::match_packs(query);
+    let voice_related = packs.iter().any(|pack| pack.id == "voice");
+    // Whole-word matching against the curated catalog, on the audience clause
+    // when it names a catalog category, otherwise on the whole description.
+    let matched = audience_clause(query)
+        .map(catalog::match_query)
+        .filter(|matched| !matched.is_empty())
+        .unwrap_or_else(|| catalog::match_query(query));
     let segment_ids = if !matched.is_empty() {
         matched
             .iter()
@@ -447,69 +486,91 @@ fn manual_search_proposal(query: &str, play: Option<&SalesPlay>) -> SearchBriefP
     } else {
         vec![catalog::GENERAL_BUSINESS]
     };
-    // Signals suited to the matched verticals, plus the phone-workflow set when
-    // the query is about calls. Ordered and deduplicated for a stable brief.
-    let mut signal_ids = Vec::new();
-    for category in &matched {
-        for signal in category.signals {
-            if !signal_ids.contains(signal) {
-                signal_ids.push(*signal);
+    // Product packs lead: they describe what a customer of *this* product
+    // shows. Catalog signals describe the vertical in general, so they are only
+    // used when no product was recognized.
+    let mut rules: Vec<QualificationRule> = Vec::new();
+    let mut push = |rule: QualificationRule| {
+        if !rules.iter().any(|existing| existing.id == rule.id) {
+            rules.push(rule);
+        }
+    };
+    for pack in &packs {
+        for id in pack.rules {
+            if let Some(template) = signals::template(id) {
+                push(signals::rule_from_template(template, "pack"));
             }
         }
     }
-    if voice_related {
-        for signal in [
-            "after_hours",
-            "call_first",
-            "appointment",
-            "intake_hiring",
-            "multiple_locations",
-        ] {
-            if !signal_ids.contains(&signal) {
-                signal_ids.push(signal);
+    if packs.is_empty() {
+        for category in &matched {
+            for id in category.signals {
+                if let Some(template) = signals::template(id) {
+                    push(signals::rule_from_template(template, "catalog"));
+                }
+            }
+        }
+        let terms = reference_terms(query);
+        if !terms.is_empty() {
+            push(QualificationRule {
+                id: "described".into(),
+                label: "Mentions what you described".into(),
+                component: "signal".into(),
+                keywords: terms.split(' ').map(str::to_string).collect(),
+                points: 35,
+                hard_gate: false,
+                origin: "query".into(),
+            });
+        }
+        if matched.is_empty() {
+            for id in ["hiring", "expansion", "recent_launch"] {
+                if let Some(template) = signals::template(id) {
+                    push(signals::rule_from_template(template, "catalog"));
+                }
             }
         }
     }
-    if signal_ids.is_empty() {
-        signal_ids = vec!["hiring", "expansion", "recent_launch"];
-    }
-    signal_ids.truncate(6);
+    rules.truncate(8);
+    let mut assumptions = vec![
+        "The business types below were inferred from your description. Edit them if they are wrong, nothing is searched until you approve this plan."
+            .to_string(),
+    ];
+    assumptions.push(if packs.is_empty() {
+        "No product type was recognized, so the signals are general ones. Add signals that describe what a good customer's own website would show.".into()
+    } else {
+        format!(
+            "Signals were chosen for {} products. Edit their keywords, mark the ones a match must have as required, or remove any that do not fit.",
+            packs
+                .iter()
+                .map(|pack| pack.label)
+                .collect::<Vec<_>>()
+                .join(" and ")
+        )
+    });
+    let personas = packs
+        .first()
+        .map(|pack| pack.personas.to_vec())
+        .unwrap_or_else(|| vec!["Owner", "Operations"]);
     SearchBriefProposal {
         product_summary: play
             .map(|value| value.offer.clone())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| query.chars().take(300).collect()),
-        customer_outcome: if voice_related {
-            "Capture and route valuable inbound calls more consistently.".into()
-        } else {
-            "Address the business outcome described in the prospecting request.".into()
-        },
+        customer_outcome: packs
+            .first()
+            .map(|pack| pack.outcome.to_string())
+            .unwrap_or_else(|| {
+                "Address the business outcome described in the prospecting request.".into()
+            }),
         segment_ids: segment_ids.into_iter().map(str::to_string).collect(),
-        target_personas: if voice_related {
-            vec![
-                "Owner",
-                "General Manager",
-                "Operations",
-                "Office Manager",
-                "Intake",
-                "Dispatch",
-            ]
-        } else {
-            vec!["Owner", "Operations"]
-        }
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
-        signal_ids: signal_ids.into_iter().map(str::to_string).collect(),
+        target_personas: personas.into_iter().map(str::to_string).collect(),
+        rules,
         exclusions: if voice_related {
             auto_exclusions(&matched)
         } else {
             Vec::new()
         },
-        assumptions: vec![
-            "The business types below were inferred from your description. Edit them if they are wrong, nothing is searched until you approve this plan."
-                .into(),
-        ],
+        assumptions,
     }
 }
 
@@ -621,6 +682,15 @@ pub fn reference_terms(query: &str) -> String {
         "people",
         "someone",
     ];
+    // The audience clause names the organizations wanted; the rest of the
+    // sentence usually describes the user's own product.
+    let query = audience_clause(query)
+        .filter(|clause| {
+            clause
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .any(|word| word.len() > 2 && !FILLER.contains(&word.to_ascii_lowercase().as_str()))
+        })
+        .unwrap_or(query);
     let mut seen = std::collections::HashSet::new();
     query
         .to_ascii_lowercase()
@@ -670,6 +740,93 @@ pub async fn propose_audience_types(client: &Client, query: &str) -> AppResult<V
     Ok(sanitize_audience_types(proposal.organization_types))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignalProposal {
+    rules: Vec<SignalProposalRule>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignalProposalRule {
+    label: String,
+    keywords: Vec<String>,
+}
+
+/// Ask the local model for extra qualification rules for this product.
+///
+/// The model sees only the user's own description and the approved segment
+/// labels, never a candidate's pages, so it proposes what to look for before
+/// any evidence exists. Its output is plain keyword rules: labels and short
+/// phrases, sanitized like any edited rule. Points and origin are set here,
+/// not by the model, and nothing it proposes is applied until the user starts
+/// the search.
+pub async fn propose_signal_rules(
+    client: &Client,
+    query: &str,
+    segment_labels: &[String],
+    existing: &[QualificationRule],
+) -> AppResult<(Vec<QualificationRule>, String)> {
+    let health = ollama_health(client).await;
+    if !health.reachable || !health.model_installed {
+        return Ok((Vec::new(), health.message));
+    }
+    let examples = existing
+        .iter()
+        .take(3)
+        .map(|rule| json!({"label": rule.label, "keywords": rule.keywords}))
+        .collect::<Vec<_>>();
+    let messages = vec![
+        json!({"role":"system","content":"You help qualify sales prospects from their public websites. Given what the user sells and who they target, propose up to four signals that a GOOD CUSTOMER's own website would visibly show if they needed this product. Each signal has a short label and two to eight keywords: literal phrases of one to four words that would appear in that website's text, such as \"now hiring servers\" or \"patient portal\". Never use words describing the product being sold, generic words like services or quality, company names, or punctuation. Do not repeat the existing signals."}),
+        json!({"role":"user","content": format!(
+            "<untrusted_user_description>\n{}\n</untrusted_user_description>\nTarget segments: {}\nExisting signals: {}",
+            query.chars().take(2_000).collect::<String>(),
+            segment_labels.join(", "),
+            serde_json::to_string(&examples)?
+        )}),
+    ];
+    let schema = json!({
+        "type":"object",
+        "properties":{"rules":{"type":"array","maxItems":4,"items":{"type":"object","properties":{
+            "label":{"type":"string","minLength":3,"maxLength":60},
+            "keywords":{"type":"array","minItems":2,"maxItems":8,"items":{"type":"string","minLength":3,"maxLength":40}}
+        },"required":["label","keywords"],"additionalProperties":false}}},
+        "required":["rules"],
+        "additionalProperties":false
+    });
+    let rules = rules_from_proposal(ollama_chat(client, messages, schema).await?)?;
+    let count = rules.len();
+    Ok((
+        rules,
+        format!(
+            "The local model suggested {count} signal{}.",
+            if count == 1 { "" } else { "s" }
+        ),
+    ))
+}
+
+/// Turn the model's proposal into bounded rules. Points, component and origin
+/// come from code; anything else the model returns is ignored.
+fn rules_from_proposal(value: Value) -> AppResult<Vec<QualificationRule>> {
+    let proposal: SignalProposal = serde_json::from_value(value)?;
+    let mut rules = proposal
+        .rules
+        .into_iter()
+        .take(4)
+        .map(|rule| QualificationRule {
+            id: format!("model_{}", rule.label),
+            label: rule.label,
+            component: "signal".into(),
+            keywords: rule.keywords,
+            points: signals::PACK_RULE_POINTS,
+            hard_gate: false,
+            origin: "model".into(),
+        })
+        .collect::<Vec<_>>();
+    signals::sanitize_rules(&mut rules);
+    Ok(rules)
+}
+
 /// Keep only plain multi-word-or-single-word nouns. Anything carrying syntax,
 /// digits, or excess length is discarded rather than looked up.
 fn sanitize_audience_types(types: Vec<String>) -> Vec<String> {
@@ -710,78 +867,6 @@ fn segment_template(id: &str) -> Option<TargetSegment> {
         id: category.id.into(),
         label: category.label.into(),
         discovery_category: Some(category.id.into()),
-    })
-}
-
-fn signal_template(id: &str) -> Option<QualificationRule> {
-    let (label, keywords, points, component) = match id {
-        "after_hours" => (
-            "After-hours or emergency service",
-            vec!["24/7", "24 hour", "after hours", "emergency service"],
-            55,
-            "signal",
-        ),
-        "call_first" => (
-            "Phone-first customer intake",
-            vec!["call now", "call us", "phone consultation", "speak with"],
-            35,
-            "signal",
-        ),
-        "appointment" => (
-            "Appointment or consultation workflow",
-            vec![
-                "schedule an appointment",
-                "book by phone",
-                "consultation",
-                "request service",
-            ],
-            35,
-            "signal",
-        ),
-        "intake_hiring" => (
-            "Intake, dispatch, or receptionist hiring",
-            vec![
-                "intake specialist",
-                "dispatcher",
-                "receptionist",
-                "customer service representative",
-            ],
-            45,
-            "signal",
-        ),
-        "multiple_locations" => (
-            "Multiple locations or service areas",
-            vec!["locations", "service areas", "areas we serve"],
-            25,
-            "icp",
-        ),
-        "hiring" => (
-            "Relevant hiring activity",
-            vec!["we are hiring", "open positions", "job openings"],
-            40,
-            "signal",
-        ),
-        "expansion" => (
-            "Expansion activity",
-            vec!["new location", "expanded", "now serving"],
-            45,
-            "signal",
-        ),
-        "recent_launch" => (
-            "Recent product or service launch",
-            vec!["launched", "introducing", "new service"],
-            35,
-            "signal",
-        ),
-        _ => return None,
-    };
-    Some(QualificationRule {
-        id: id.into(),
-        label: label.into(),
-        component: component.into(),
-        keywords: keywords.into_iter().map(str::to_string).collect(),
-        points,
-        hard_gate: false,
     })
 }
 
@@ -902,7 +987,7 @@ where
         (output, digest, unsupported, verified_claims)
     } else {
         return Err(AppError::Message(
-            "Unknown AI provider. Hosted fallback is intentionally unavailable.".into(),
+            "Unknown drafting provider. Hosted fallback is intentionally unavailable.".into(),
         ));
     };
     progress(90, "Claims verified")?;
@@ -997,7 +1082,7 @@ where
     Ok((assessment, draft, output.call_brief))
 }
 
-fn validate_shape(output: &AiPackageOutput) -> AppResult<()> {
+fn validate_shape(output: &DraftPackageOutput) -> AppResult<()> {
     if output.subject.trim().is_empty()
         || output.body.trim().is_empty()
         || output.call_brief.hypotheses.len() != 2
@@ -1010,7 +1095,7 @@ fn validate_shape(output: &AiPackageOutput) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_citations(output: &AiPackageOutput, valid_ids: &HashSet<&str>) -> AppResult<()> {
+fn validate_citations(output: &DraftPackageOutput, valid_ids: &HashSet<&str>) -> AppResult<()> {
     if output.claim_evidence.is_empty() {
         return Err(AppError::Message(
             "The draft contained no evidence-linked claims. No artifact was published.".into(),
@@ -1062,7 +1147,11 @@ fn validate_citations(output: &AiPackageOutput, valid_ids: &HashSet<&str>) -> Ap
     Ok(())
 }
 
-fn fake_output(package: &ProspectPackage, play: &SalesPlay, draft_kind: &str) -> AiPackageOutput {
+fn fake_output(
+    package: &ProspectPackage,
+    play: &SalesPlay,
+    draft_kind: &str,
+) -> DraftPackageOutput {
     let evidence = &package.evidence[0];
     let signal = package
         .signals
@@ -1081,7 +1170,7 @@ fn fake_output(package: &ProspectPackage, play: &SalesPlay, draft_kind: &str) ->
         play.offer.trim()
     );
     let id = evidence.id.clone();
-    AiPackageOutput {
+    DraftPackageOutput {
         reasons: vec![CitedReason {
             text: "The account has current, attributable public evidence.".into(),
             evidence_ids: vec![id.clone()],
@@ -1189,8 +1278,8 @@ mod tests {
             None,
         );
         assert!(proposal.segment_ids.contains(&"plumber".into()));
-        assert!(proposal.signal_ids.contains(&"after_hours".into()));
-        assert!(proposal.signal_ids.contains(&"intake_hiring".into()));
+        assert!(proposal.rules.iter().any(|rule| rule.id == "after_hours"));
+        assert!(proposal.rules.iter().any(|rule| rule.id == "intake_hiring"));
         assert!(proposal.segment_ids.len() <= catalog::MAX_MATCHED_CATEGORIES);
         assert!(!proposal.segment_ids.iter().any(|value| value.contains('[')));
         // Every compiled segment must resolve to a curated catalog entry, so
@@ -1279,6 +1368,59 @@ mod tests {
     }
 
     #[test]
+    fn model_rules_take_points_and_origin_from_code() {
+        let rules = rules_from_proposal(json!({"rules":[
+            {"label":"Hourly hiring","keywords":["now hiring servers","services","shift leads"],"points":100,"hardGate":true},
+            {"label":"Nothing","keywords":["the","quality"]}
+        ]}))
+        .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].points, signals::PACK_RULE_POINTS);
+        assert!(!rules[0].hard_gate);
+        assert_eq!(rules[0].origin, "model");
+        assert_eq!(rules[0].id, "model_hourly_hiring");
+        assert_eq!(rules[0].keywords, vec!["now hiring servers", "shift leads"]);
+    }
+
+    #[test]
+    fn product_words_do_not_become_target_segments() {
+        let hipaa = manual_search_proposal(
+            "We sell HIPAA compliance and patient data security software to dental practices",
+            None,
+        );
+        assert_eq!(hipaa.segment_ids, vec!["dentist"]);
+        assert!(hipaa
+            .rules
+            .iter()
+            .any(|rule| rule.id == "client_data_online"));
+        assert!(!hipaa.rules.iter().any(|rule| rule.id == "after_hours"));
+
+        let payroll = manual_search_proposal(
+            "I sell payroll and shift scheduling software to restaurants with hourly staff",
+            None,
+        );
+        assert_eq!(payroll.segment_ids, vec!["restaurant"]);
+        assert_eq!(payroll.rules[0].id, "hourly_hiring");
+        assert!(payroll.rules.iter().all(|rule| rule.origin == "pack"));
+        assert_eq!(
+            reference_terms(
+                "I sell payroll and shift scheduling software to restaurants with hourly staff"
+            ),
+            "restaurants hourly staff"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_product_gets_a_description_rule_and_says_so() {
+        let proposal = manual_search_proposal("Find breweries that might stock our cider", None);
+        assert!(proposal.rules.iter().any(|rule| rule.origin == "query"));
+        assert!(proposal
+            .assumptions
+            .iter()
+            .any(|item| item.contains("No product type was recognized")));
+    }
+
+    #[test]
     fn reference_terms_describe_the_audience_not_the_sentence() {
         assert_eq!(
             reference_terms(
@@ -1337,7 +1479,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_evidence_ids() {
-        let output = AiPackageOutput {
+        let output = DraftPackageOutput {
             reasons: vec![CitedReason {
                 text: "Reason".into(),
                 evidence_ids: vec!["missing".into()],
